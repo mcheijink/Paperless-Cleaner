@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Settings - Paperless Cleaner</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Settings</h1>
+      <nav><a href="/">Back</a></nav>
+    </header>
+    <main>
+      <form id="settingsForm" class="card">
+        <label>Paperless Base URL<input name="paperless_base_url" required /></label>
+        <label>Paperless API Token<input name="paperless_token" /></label>
+        <label>Ollama Base URL<input name="ollama_base_url" required /></label>
+        <label>Ollama Model<input name="ollama_model" required /></label>
+        <label>Suggestion Provider
+          <select name="suggestion_provider">
+            <option value="ollama">Ollama</option>
+            <option value="heuristic">Heuristic</option>
+          </select>
+        </label>
+        <button type="submit">Save settings</button>
+      </form>
+      <p id="status"></p>
+    </main>
+    <script src="/static/settings.js"></script>
+  </body>
+</html>

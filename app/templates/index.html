@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Paperless Cleaner</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Paperless Cleaner</h1>
+      <nav>
+        <a href="/settings">Settings</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="toolbar">
+        <label>Sort by
+          <select id="sortBy">
+            <option value="name">Name</option>
+            <option value="tags">Tags</option>
+            <option value="quality">Quality</option>
+          </select>
+        </label>
+        <button id="refreshBtn">Refresh</button>
+        <button id="suggestBtn">Generate suggestions</button>
+      </section>
+
+      <section>
+        <table>
+          <thead>
+            <tr>
+              <th>Select</th>
+              <th>Title</th>
+              <th>Tags</th>
+              <th>Quality</th>
+            </tr>
+          </thead>
+          <tbody id="entryRows"></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Suggestions</h2>
+        <div id="suggestions"></div>
+        <button id="applyBtn">Apply approved changes</button>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
