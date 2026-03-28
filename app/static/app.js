@@ -8,15 +8,24 @@ const applyBtn = document.getElementById('applyBtn');
 let currentEntries = [];
 let currentSuggestions = [];
 
+function esc(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function renderEntries(entries) {
   rows.innerHTML = '';
   entries.forEach((entry) => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td><input type="checkbox" data-id="${entry.id}" /></td>
-      <td>${entry.title}</td>
-      <td>${entry.tags.join(', ')}</td>
-      <td>${entry.quality}</td>
+      <td><input type="checkbox" data-id="${esc(entry.id)}" /></td>
+      <td>${esc(entry.title)}</td>
+      <td>${esc(entry.tags.join(', '))}</td>
+      <td>${esc(entry.quality)}</td>
     `;
     rows.appendChild(tr);
   });
@@ -28,13 +37,13 @@ function renderSuggestions(items) {
     const card = document.createElement('div');
     card.className = 'card';
     card.innerHTML = `
-      <label><input type="checkbox" data-approve="${item.id}" checked /> Approve</label>
-      <p><strong>Entry ID:</strong> ${item.id}</p>
-      <label>Title <input data-title="${item.id}" value="${item.suggested_title}" /></label>
+      <label><input type="checkbox" data-approve="${esc(item.id)}" checked /> Approve</label>
+      <p><strong>Entry ID:</strong> ${esc(item.id)}</p>
+      <label>Title <input data-title="${esc(item.id)}" value="${esc(item.suggested_title)}" /></label>
       <label>Tags (comma separated)
-        <input data-tags="${item.id}" value="${item.suggested_tags.join(', ')}" />
+        <input data-tags="${esc(item.id)}" value="${esc(item.suggested_tags.join(', '))}" />
       </label>
-      <p><em>${item.reason}</em></p>
+      <p><em>${esc(item.reason)}</em></p>
     `;
     suggestionsContainer.appendChild(card);
   });
@@ -42,6 +51,10 @@ function renderSuggestions(items) {
 
 async function loadEntries() {
   const response = await fetch(`/api/entries?sort_by=${sortBy.value}`);
+  if (!response.ok) {
+    rows.innerHTML = `<tr><td colspan="4">Failed to load entries: ${esc(await response.text())}</td></tr>`;
+    return;
+  }
   currentEntries = await response.json();
   renderEntries(currentEntries);
 }
@@ -57,6 +70,10 @@ async function generateSuggestions() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ids: selected }),
   });
+  if (!response.ok) {
+    alert(`Failed to generate suggestions: ${await response.text()}`);
+    return;
+  }
   currentSuggestions = await response.json();
   renderSuggestions(currentSuggestions);
 }
