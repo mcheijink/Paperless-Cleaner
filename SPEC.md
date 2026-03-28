@@ -41,10 +41,14 @@ Persisted in `app/settings.json`. Seeded from environment variables on first run
 ### 3.2 Entry (document as seen by the UI)
 
 ```
-id        int
-title     string
-tags      string[]   — resolved tag names (not IDs)
-quality   int        — 0–100, see §5
+id               int
+title            string
+correspondent    string | null   — resolved name (not ID)
+document_type    string | null   — resolved name (not ID)
+date             string | null   — ISO date (created date from Paperless)
+tags             string[]        — resolved tag names (not IDs)
+heuristic_quality  int           — 0–100, see §5 tier 1
+llm_quality        int | null    — 0–100, see §5 tier 2; null until LLM has been run for this document
 ```
 
 ### 3.3 SuggestedTag
@@ -59,6 +63,7 @@ is_new        bool     — true if the tag does not exist in Paperless-NGX
 
 ```
 id                int             — document ID
+title_quality     int             — LLM's assessment of the current title quality (0–100)
 suggested_title   string
 suggested_tags    SuggestedTag[]
 reason            string
@@ -112,7 +117,7 @@ Saves new settings to `app/settings.json`.
 ### 4.5 `GET /api/entries?sort_by=<name|tags|quality>`
 Fetches all documents from Paperless-NGX, resolves tag IDs to names, computes quality scores, and returns a sorted list.
 
-**Query parameter**: `sort_by` — `name` (default, A→Z), `tags` (descending), `quality` (ascending, worst first).
+**Query parameter**: `sort_by` — `name` (default, A→Z), `tags` (descending), `quality` (ascending, worst first — uses `llm_quality` if available, otherwise `heuristic_quality`).
 
 **Response**: array of Entry objects (see §3.2).
 
@@ -129,9 +134,10 @@ Generates metadata suggestions for the given document IDs.
 **Response**: array of Suggestion objects (see §3.4).
 
 **Behaviour**:
-- Fetches fresh document data and full tag map from Paperless-NGX.
+- Fetches fresh document data, full tag map, correspondent map, and document type map from Paperless-NGX.
 - For each ID, calls the configured suggestion provider.
 - Each SuggestedTag includes `is_new: true` if the tag name is not in the Paperless-NGX tag map.
+- The returned `title_quality` score is stored against the document so subsequent calls to `GET /api/entries` can return it as `llm_quality`.
 - If provider is `"ollama"` and the Ollama call fails, falls back to heuristic silently.
 - Documents not found in Paperless-NGX are skipped (no error).
 
@@ -171,32 +177,99 @@ Applies a list of approved changes back to Paperless-NGX, optionally creating ne
 
 ## 5. Quality scoring
 
-Score is an integer in the range 0–100, computed locally from title and tags.
+Quality is tracked as two separate scores per document.
+
+### 5.1 Heuristic quality score (tier 1)
+
+Computed locally on every page load. No LLM call required. Range: 0–100.
+
+**Word count** (primary signal — a good title is 3–6 words):
+
+| Word count | Points |
+|---|---|
+| 3–6 words | 60 |
+| 2 words | 35 |
+| 7+ words | 35 |
+| 1 word | 15 |
+| 0 words / empty | 0 |
+
+**Casing** (sentence case is the target convention):
 
 | Criterion | Points |
 |---|---|
-| Title ≥ 8 characters | 50 |
-| Title 3–7 characters | 25 |
-| Title < 3 characters | 0 |
-| Tags: 15 × tag count, capped at 3 tags | 0–45 |
-| Title contains at least one uppercase letter | 5 |
+| Sentence case (first word capitalised, rest lowercase) | 15 |
+| At least one capital letter | 5 |
+| All lowercase | 0 |
 
-> **Open question**: Are these thresholds and weights correct? Should additional signals be included (e.g. document has a date, title contains only digits/underscores)?
+**Tags** (presence of tags is a signal of a processed document):
+
+| Criterion | Points |
+|---|---|
+| Tags: 9 pts × tag count, capped at 3 tags | 0–27 |
+
+**Penalties** (applied after summing; score floors at 0):
+
+| Pattern | Penalty |
+|---|---|
+| Filename-like: underscores with no spaces, or matches `scan\d+` / `doc_` / `IMG_` / all-digit string | −30 |
+| High digit ratio: >40% of characters are digits | −20 |
+
+Maximum score: 102 (rounded to 100). A 3–6 word sentence-case title with 3+ tags and no bad patterns scores 100.
+
+### 5.2 LLM quality score (tier 2)
+
+Returned by the LLM when generating suggestions (see §6.1). Stored in `settings.json` keyed by document ID. Range: 0–100, `null` until the LLM has been run for that document.
+
+Reflects semantic quality: does the title actually describe the content of the document in 3–6 words, in sentence case, without redundant metadata?
+
+**Sort order**: when sorting by quality, `llm_quality` is used if available; otherwise `heuristic_quality` is used as the fallback.
 
 ---
 
-## 6. Suggestion providers
+## 6. Title convention
 
-### 6.1 Ollama
+A well-formed title in this library:
+
+- Is in **sentence case** — first word capitalised, rest lowercase (e.g. `Kfz versicherungsschein renewal`, not `KFZ Versicherungsschein Renewal`)
+- Is **3–6 words** — concise enough to scan at a glance
+- Describes the **specific subject** of the document — what it is about, not what type it is
+- Contains **no redundant metadata** — correspondent, document type, and date are all stored as separate fields in Paperless-NGX and displayed alongside the title; they must not be repeated in the title
+- Contains **no reference numbers, policy numbers, or scanner-generated strings** — these are present in the OCR-extracted content and are fully searchable without appearing in the title
+- Is written in the **language of the document**
+
+Examples:
+
+| Current (bad) | Improved |
+|---|---|
+| `scan0047` | `Electricity bill January` |
+| `Versicherungsschein_Kfz-Versicherung_AD-9512372748_2026-03-20` | `Kfz versicherungsschein renewal` |
+| `20231015123456` | `Salary statement October` |
+| `IMG_20240302_invoice_final_v2` | `Freelance invoice Q1` |
+
+---
+
+## 7. Suggestion providers
+
+### 7.1 Ollama
 
 - Calls `POST {ollama_base_url}/api/generate` with `stream: false` and `format: "json"`.
-- The prompt includes:
-  - The document's current title.
-  - The document's currently applied tags.
-  - The **full list of all tags** that exist in Paperless-NGX, so the model can prefer existing tags over inventing new ones.
-- The prompt instructs the model to return a JSON object:
+
+**Prompt context** — the following are passed to the model for each document:
+  - Current title
+  - Correspondent name (resolved; or `"unknown"` if unset)
+  - Document type name (resolved; or `"unknown"` if unset)
+  - Created date (ISO format; or `"unknown"` if unset)
+  - Currently applied tag names
+  - Full list of all tag names that exist in Paperless-NGX
+  - First 500 characters of OCR-extracted content (`content` field from Paperless API)
+
+**Prompt instruction** (summary):
+> You improve document metadata for a Paperless-NGX archive. The correspondent, document type, and date are already stored as separate fields — do not include them in the title. Generate a sentence case title of 3–6 words describing only the specific subject of the document. Prefer existing tags over creating new ones; only suggest a new tag if no existing tag is adequate.
+
+**Expected JSON response**:
   ```json
   {
+    "title_quality": 45,
     "suggested_title": "string",
     "suggested_tags": [
       { "name": "string", "confidence": 0.0 }
@@ -204,11 +277,13 @@ Score is an integer in the range 0–100, computed locally from title and tags.
     "reason": "string"
   }
   ```
-- `confidence` is a self-reported float (0.0–1.0). The prompt instructs the model to assign lower confidence to new tags and only suggest them when no existing tag is sufficient.
+
+- `title_quality` (0–100): the model's assessment of how good the *current* title is. This is stored as `llm_quality` on the document entry.
+- `confidence` per tag (0.0–1.0): self-reported. The prompt instructs the model to prefer existing tags (high confidence) and only propose new ones when genuinely warranted (which should result in lower confidence scores for invented tags).
 - The backend marks each tag as `is_new: true` if its name is absent from the Paperless-NGX tag map (case-insensitive).
 - Falls back to heuristic on any error (network, non-200, malformed JSON).
 
-### 6.2 Heuristic
+### 7.2 Heuristic
 
 Local, offline. No external calls.
 
@@ -218,14 +293,14 @@ Local, offline. No external calls.
 
 ---
 
-## 7. Frontend pages
+## 8. Frontend pages
 
-### 7.1 Main page (`/`)
+### 8.1 Main page (`/`)
 
 **Layout**
 - Header with app name and link to Settings.
 - Toolbar: sort selector (`name` / `tags` / `quality`), Refresh button, Generate suggestions button.
-- Document table: checkbox | Title | Tags | Quality score.
+- Document table: checkbox | Title | Correspondent | Document type | Tags | Quality score (LLM score shown if available, heuristic otherwise).
 - Suggestions section: cards (one per document), Apply approved changes button.
 
 **Behaviour**
@@ -244,7 +319,7 @@ Local, offline. No external calls.
 - Failed `POST /api/suggestions`: displays alert.
 - Failed `POST /api/apply`: displays alert.
 
-### 7.2 Settings page (`/settings`)
+### 8.2 Settings page (`/settings`)
 
 **Layout**
 - Header with page title and Back link.
@@ -257,19 +332,21 @@ Local, offline. No external calls.
 
 ---
 
-## 8. External integrations
+## 9. External integrations
 
-### 8.1 Paperless-NGX
+### 9.1 Paperless-NGX
 
 - **Auth**: `Authorization: Token <paperless_token>` header. Omitted if token is empty.
 - **Pagination**: follows `next` URL in paginated responses until exhausted.
 - **Endpoints used**:
-  - `GET /api/documents/` — fetch all documents
+  - `GET /api/documents/` — fetch all documents (includes `content`, `correspondent`, `document_type`, `created` fields)
   - `GET /api/tags/` — fetch all tags
+  - `GET /api/correspondents/` — fetch all correspondents (to resolve IDs → names)
+  - `GET /api/document_types/` — fetch all document types (to resolve IDs → names)
   - `POST /api/tags/` — create a new tag
   - `PATCH /api/documents/{id}/` — update a document
 
-### 8.2 Ollama
+### 9.2 Ollama
 
 - **Endpoint**: `POST /api/generate`
 - **Timeout**: 60 seconds (longer than Paperless calls due to inference time).
@@ -277,20 +354,20 @@ Local, offline. No external calls.
 
 ---
 
-## 9. Deployment
+## 10. Deployment
 
 - Docker image based on `python:3.12-slim`.
 - Single `paperless-cleaner` service, port `8080`.
 - `app/settings.json` bind-mounted from host for persistence. **Must be created (`touch app/settings.json`) before first `docker compose up`.**
+- `llm_quality` scores are persisted in `settings.json` keyed by document ID so they survive restarts.
 - Auto-restart unless stopped.
 
 ---
 
-## 10. Open questions / future considerations
+## 11. Open questions / future considerations
 
 1. **Batch Ollama calls**: currently one HTTP round-trip per document. Could be parallelised with `asyncio.gather`.
-2. **Quality score tuning**: see §5 — are current thresholds appropriate?
-5. **Loading states**: the UI has no spinner or disabled state during API calls; rapid clicks could cause race conditions.
-6. **Paperless-NGX token security**: the token is stored in plaintext in `settings.json` and returned by `GET /api/settings`. Access to the app should be restricted at the network level.
-7. **Filtering**: no way to filter by tag, date range, or quality threshold — only sorting is supported.
-8. **Select all**: no "select all" checkbox in the document table.
+2. **Loading states**: the UI has no spinner or disabled state during API calls; rapid clicks could cause race conditions.
+3. **Paperless-NGX token security**: the token is stored in plaintext in `settings.json` and returned by `GET /api/settings`. Access to the app should be restricted at the network level.
+4. **Filtering**: no way to filter by tag, date range, or quality threshold — only sorting is supported.
+5. **Select all**: no "select all" checkbox in the document table.
