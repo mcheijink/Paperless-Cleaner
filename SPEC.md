@@ -41,14 +41,15 @@ Persisted in `app/settings.json`. Seeded from environment variables on first run
 ### 3.2 Entry (document as seen by the UI)
 
 ```
-id               int
-title            string
-correspondent    string | null   — resolved name (not ID)
-document_type    string | null   — resolved name (not ID)
-date             string | null   — ISO date (created date from Paperless)
-tags             string[]        — resolved tag names (not IDs)
-heuristic_quality  int           — 0–100, see §5 tier 1
-llm_quality        int | null    — 0–100, see §5 tier 2; null until LLM has been run for this document
+id                 int
+title              string
+correspondent      string | null   — resolved name (not ID)
+document_type      string | null   — resolved name (not ID)
+date               string | null   — ISO date (created date from Paperless)
+tags               string[]        — resolved tag names (not IDs)
+heuristic_quality  int             — 0–100, see §5 tier 1
+llm_quality        int | null      — 0–100, see §5 tier 2; null until LLM has been run
+suggestion_status  string          — "none" | "pending" | "ready" | "applied"
 ```
 
 ### 3.3 SuggestedTag
@@ -73,10 +74,12 @@ reason            string
 
 ```
 id          int
-title       string
-tags        string[]   — names of existing tags to apply
-tags_new    string[]   — names of new tags to create and apply
+title       string | null    — if null, title is not updated
+tags        string[] | null  — if null, tags are not updated
+tags_new    string[]         — names of new tags to create and apply (ignored if tags is null)
 ```
+
+Allowing `null` for `title` and `tags` supports per-field apply from both the table comparison view and the document review pane.
 
 ---
 
@@ -162,7 +165,7 @@ Cancels all pending (not yet started) items in the suggestion queue. The documen
 ```
 
 ### 4.9 `POST /api/apply`
-Applies a list of approved changes back to Paperless-NGX, optionally creating new tags first.
+Applies a list of approved changes back to Paperless-NGX, optionally creating new tags first. Supports per-field updates — set `title` or `tags` to `null` to leave that field unchanged.
 
 **Request body**
 ```json
@@ -182,7 +185,8 @@ Applies a list of approved changes back to Paperless-NGX, optionally creating ne
 - Fetches the current tag map from Paperless-NGX to resolve tag names → IDs.
 - For each name in `tags_new`, creates the tag via `POST /api/tags/` and adds the new ID to the set to apply.
 - Tags in `tags` not found in Paperless-NGX are dropped (should not occur if the UI is correct).
-- Issues a `PATCH` request per document.
+- Only includes non-null fields in the `PATCH` payload per document.
+- Updates `suggestion_status` to `"applied"` for each successfully updated document.
 
 **Response**
 ```json
@@ -190,6 +194,16 @@ Applies a list of approved changes back to Paperless-NGX, optionally creating ne
 ```
 
 **Error**: `502` if any Paperless-NGX request fails.
+
+### 4.10 `GET /api/documents/{id}/thumb`
+Proxies the document thumbnail from Paperless-NGX. The Paperless token is added server-side; the browser never needs direct access to Paperless.
+
+**Response**: JPEG image stream, content-type `image/jpeg`.
+
+### 4.11 `GET /api/documents/{id}/preview`
+Proxies the full document preview (PDF) from Paperless-NGX, streamed to avoid loading the entire file into memory.
+
+**Response**: PDF stream, content-type `application/pdf`.
 
 ---
 
@@ -315,32 +329,94 @@ Local, offline. No external calls.
 
 ### 8.1 Main page (`/`)
 
-**Layout**
-- Header with app name and link to Settings.
-- Toolbar: sort selector (`name` / `tags` / `quality`), Refresh button, Generate suggestions button.
-- Document table: checkbox | Title | Correspondent | Document type | Tags | Quality score (LLM score shown if available, heuristic otherwise).
-- Suggestions section: cards (one per document), Apply approved changes button.
+#### Layout
 
-**Behaviour**
-- On load: fetches and renders the document list.
-- Sort selector change: re-fetches with new sort parameter.
-- Refresh button: re-fetches document list.
-- Generate suggestions: adds selected IDs to the suggestion task queue (see §8.3); suggestion cards render progressively as results arrive.
-- Each card: approve checkbox (checked by default), editable title input, tag list with per-tag controls, reason text.
-- Each tag in the card is shown as a badge. New tags (`is_new: true`) are visually distinct (e.g. dashed border or different colour).
-- New tags with confidence ≥ 0.8 show a "Create & apply" toggle (on by default). New tags with confidence < 0.8 show the same toggle but default to off.
-- Existing tags are always applied as normal when the card is approved.
-- Apply: collects approved cards, builds `tags` (existing) and `tags_new` (new tags with "Create & apply" toggled on) per entry, POSTs to `/api/apply`, shows success/error alert including any tags created, then refreshes document list.
+```
+┌─────────────────────────────────────────────────────────┐
+│  Paperless Cleaner                          [Settings]   │
+├─────────────────────────────────────────────────────────┤
+│  [Refresh]  [Generate suggestions ▸]                    │
+│  [Show suggestions (3 ready)]  [Apply all approved (2)] │
+├─────────────────────────────────────────────────────────┤
+│  Active filters: Correspondent: ADAC ×   Quality < 50 × │
+├──┬────────┬────────────┬───────────────┬─────┬──────────┤
+│☑ │Status ▾│Title      ▾│Correspondent ▾│Tags▾│Quality  ▾│
+├──┼────────┼────────────┼───────────────┼─────┼──────────┤
+│  │  🟢   │ scan0047   │ ADAC          │ ... │  12      │
+│  │  🟡   │ 20231015.. │ Belasting..   │ ... │   8      │
+│  │  ⚪   │ Contract.. │ ING           │ ... │  75      │
+└──┴────────┴────────────┴───────────────┴─────┴──────────┘
+                                                           │
+                                        [Document pane]   │
+```
 
-**Loading states**
-- **Paperless-NGX calls** (expected < 2 s): buttons that trigger a Paperless request are disabled and show a spinner label (e.g. "Refreshing…") for the duration. A new request cannot be triggered until the previous one completes.
-- **Ollama calls** (may take 10–30 s per document): handled via the task queue (§8.3). The "Generate suggestions" button is disabled while the queue is non-empty. A progress indicator shows "Processing 2 of 5…" updating as each document completes.
-- **Apply**: the "Apply approved changes" button is disabled until at least one suggestion card is approved, and again while the apply request is in flight.
+**Columns**: ☑ (select) | Status | Title | Correspondent | Document type | Date | Tags | Quality
 
-**Error handling**
-- Failed `GET /api/entries`: displays inline error message in the table.
-- Failed suggestion (single document): the card for that document shows an error state; other cards are unaffected.
-- Failed `POST /api/apply`: displays inline error; successfully applied entries are still reflected on refresh.
+When "Show suggestions" is active, two additional columns appear between the originals and Quality: **Suggested title** | **Suggested tags**.
+
+#### Column header controls (Excel-style)
+
+Clicking any column header opens a dropdown containing:
+
+- **Sort ascending / Sort descending** — clicking again toggles direction; an arrow indicator on the header shows the active sort
+- **Column-specific filter**:
+  - *Title*: free text search (substring match)
+  - *Correspondent, Document type, Status*: checkbox list of all values present in the current data
+  - *Tags*: checkbox list of all tag names — a document matches if it has any of the checked tags
+  - *Quality*: range slider (min / max)
+  - *Date*: date range picker (from / to)
+- **Clear filter** — removes the filter for this column
+
+Active filters are shown as removable chips in a filter bar above the table. A "Clear all filters" button removes all at once. Filtering and sorting are applied client-side on the loaded dataset — no re-fetch required.
+
+#### Suggestion status indicator
+
+Each row has a coloured status dot in the Status column:
+
+| Dot | Meaning |
+|---|---|
+| ⚪ Grey | No suggestion requested |
+| 🟡 Yellow | Queued or being processed by Ollama |
+| 🟢 Green | Suggestion ready, not yet applied |
+| 🔵 Blue | Suggestion has been applied |
+
+#### Show suggestions toggle
+
+A toolbar button **"Show suggestions (N ready)"** where N is the count of documents with `suggestion_status = "ready"`. When active:
+- The table gains **Suggested title** and **Suggested tags** columns.
+- Each suggestion cell shows the suggested value with a per-field **Apply** button and an approve checkbox.
+- Rows without a ready suggestion show an empty cell in those columns.
+
+#### Document review pane
+
+Clicking any table row opens a right-side panel:
+
+- **Left**: document thumbnail (from `GET /api/documents/{id}/thumb`) with a link to open the full PDF preview in a new tab (`GET /api/documents/{id}/preview`).
+- **Right**: metadata fields in a layout similar to the Paperless-NGX document view:
+  - Each field shows the current value.
+  - If a suggestion is ready, the suggested value is shown directly below in a distinct style, with an **Apply** button for that field.
+  - Fields: Title, Correspondent, Document type, Date, Tags (as badges; new suggested tags show confidence and a "Create & apply" toggle).
+  - **Apply all suggestions** button at the top applies all suggested fields in one action.
+  - **Approve** checkbox — synced with the table row's approval state.
+- Closing the pane returns to the full table.
+
+#### Approval and apply workflow
+
+- Each document with a ready suggestion has an **approve checkbox** — visible in the table (when "Show suggestions" is on) and in the review pane. Approval state is shared between both views.
+- **"Apply all approved"** button: disabled until at least one document is approved; applies all approved documents in a single `POST /api/apply` call. On success, approved rows update to `suggestion_status = "applied"` (🔵) and the button resets.
+- **Per-field apply** (from table or pane): sends a `POST /api/apply` with only the relevant field set; the other field is `null`.
+
+#### Loading states
+
+- **Paperless calls** (< 2 s): the triggering button is disabled and shows a spinner label (e.g. "Refreshing…"). A new request to the same endpoint is blocked until the previous one completes.
+- **Ollama queue** (10–30 s per document): the "Generate suggestions" button is disabled while the queue is non-empty. A progress bar and "Processing N of M…" label update as each document completes. The "Show suggestions" badge count updates in real time as results arrive.
+- **Apply**: the "Apply all approved" button is disabled while the apply request is in flight.
+
+#### Error handling
+
+- Failed page load: inline error message in the table body.
+- Failed suggestion (single document): that row's status shows an error indicator; other rows are unaffected.
+- Failed apply (single document): inline error shown below the table; successfully applied documents are still updated.
 
 ### 8.2 Request handling and task queue architecture
 
@@ -377,6 +453,15 @@ Ollama can only process one document at a time (single GPU, serial inference). S
 - The apply button is disabled until at least one card is approved and while the request is in flight.
 - Errors are shown inline; the document list is refreshed on success.
 
+#### Graceful shutdown
+
+When the container receives SIGTERM (e.g. `docker compose stop`):
+1. The pending queue is cleared immediately — no new Ollama calls are started.
+2. The in-flight Ollama HTTP request is cancelled via httpx task cancellation. Ollama stops receiving the connection and halts generation.
+3. FastAPI completes the shutdown sequence.
+
+The Docker Compose `stop_grace_period` must be set to at least the Ollama timeout (60 s) to allow this to complete cleanly before Docker sends SIGKILL. The default 10 s is not sufficient.
+
 ---
 
 ### 8.3 Settings page (`/settings`)
@@ -405,6 +490,8 @@ Ollama can only process one document at a time (single GPU, serial inference). S
   - `GET /api/document_types/` — fetch all document types (to resolve IDs → names)
   - `POST /api/tags/` — create a new tag
   - `PATCH /api/documents/{id}/` — update a document
+  - `GET /api/documents/{id}/thumb/` — proxied for thumbnail display (see §4.10)
+  - `GET /api/documents/{id}/preview/` — proxied for PDF preview (see §4.11)
 
 ### 9.2 Ollama
 
@@ -419,17 +506,19 @@ Ollama can only process one document at a time (single GPU, serial inference). S
 - Docker image based on `python:3.12-slim`.
 - Single `paperless-cleaner` service, port `8080`.
 - `app/settings.json` bind-mounted from host for persistence. **Must be created (`touch app/settings.json`) before first `docker compose up`.**
-- `llm_quality` scores are persisted in `settings.json` keyed by document ID so they survive restarts.
+- `llm_quality` scores and `suggestion_status` are persisted in `settings.json` keyed by document ID so they survive restarts.
+- `stop_grace_period: 70s` — allows the in-flight Ollama request (60 s timeout) to be cancelled cleanly before Docker sends SIGKILL.
 - Auto-restart unless stopped.
 
 ---
 
-## 11. Open questions / future considerations
+## 11. Resolved decisions
 
-1. **Task queue persistence**: the backend task queue (§8.2) lives in memory. If the container restarts mid-run, queued jobs are lost. Should the queue be persisted to `settings.json`, or is losing in-progress suggestions on restart acceptable?
-2. **Paperless-NGX token security**: the token is stored in plaintext in `settings.json`. `GET /api/settings` masks the value as `"***"` so it is never transmitted to the browser. Access to the app itself should be restricted at the network level — do not expose port 8080 beyond a trusted local network.
-3. **Filtering**: no way to filter by tag, date range, or quality threshold — only sorting is supported.
-4. **Select all**: no "select all" checkbox in the document table.
+1. **Task queue persistence** — losing queued jobs on container restart is acceptable. Graceful shutdown ensures Ollama stops promptly (see §8.2).
+2. **Paperless-NGX token security** — token masked in `GET /api/settings`; plaintext storage accepted; network-level restriction is the user's responsibility.
+3. **Filtering** — promoted to core feature (see §8.1).
+4. **Loading states** — resolved via loading states spec and task queue architecture (see §8.1, §8.2).
+5. **Batch Ollama calls** — resolved via serial task queue with progressive frontend rendering (see §8.2).
 
 ---
 
@@ -438,6 +527,5 @@ Ollama can only process one document at a time (single GPU, serial inference). S
 These are out of scope for the current implementation but worth revisiting later.
 
 1. **App-level authentication**: a password configured in settings that gates access to the entire UI. Useful if the app is reachable beyond a trusted local network.
-2. **Filtering**: filter the document list by tag, correspondent, document type, quality threshold, or date range.
-3. **Select all**: a "select all" checkbox to queue the entire visible document list for suggestion generation.
-4. **Task queue persistence**: survive container restarts without losing queued suggestion jobs.
+2. **Select all filtered**: a checkbox to select all currently visible (filtered) rows at once for bulk suggestion generation.
+3. **Task queue persistence**: survive container restarts without losing queued suggestion jobs.
