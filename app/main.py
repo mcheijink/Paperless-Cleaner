@@ -245,7 +245,8 @@ async def suggestions(payload: SuggestRequest) -> list[Suggestion]:
 @app.post("/api/apply")
 async def apply_changes(payload: ApplyRequest) -> dict[str, Any]:
     settings = load_settings()
-    headers = {"Authorization": f"Token {settings.paperless_token}", "Content-Type": "application/json"}
+    auth_headers = {"Authorization": f"Token {settings.paperless_token}"} if settings.paperless_token else {}
+    headers = {**auth_headers, "Content-Type": "application/json"}
     tag_map = await get_tag_map(settings)
     inverse_tag_map = {v.lower(): k for k, v in tag_map.items()}
 
