@@ -37,6 +37,13 @@ Persisted in `app/settings.json`. Seeded from environment variables on first run
 | `ollama_base_url` | string | `http://ollama:11434` | `OLLAMA_BASE_URL` |
 | `ollama_model` | string | `llama3.1` | `OLLAMA_MODEL` |
 | `suggestion_provider` | `"ollama"` \| `"heuristic"` | `"ollama"` | `SUGGESTION_PROVIDER` |
+| `ollama_temperature` | float | `0.0` | `OLLAMA_TEMPERATURE` |
+| `confidence_discount` | float | `0.2` | `CONFIDENCE_DISCOUNT` |
+| `few_shot_min_documents` | int | `5` | `FEW_SHOT_MIN_DOCUMENTS` |
+
+- `ollama_temperature`: `0.0` gives deterministic output, which is strongly preferred for structured metadata extraction. Can be raised slightly (e.g. `0.1`) if the model produces repetitive results.
+- `confidence_discount`: subtracted from all LLM-reported confidence scores before the 0.8 threshold is applied. Local models are systematically overconfident; a discount of 0.2 means the model must report ≥ 1.0 for a new tag to default on, effectively making the "Create & apply" toggle default to off until the user adjusts this setting.
+- `few_shot_min_documents`: minimum number of user-reviewed documents (those with `suggestion_status = "done"` and at least one field applied) required before library examples are used in the prompt. Falls back to generic built-in examples below this threshold.
 
 ### 3.2 Entry (document as seen by the UI)
 
@@ -85,12 +92,18 @@ confidence    float    — 0.0–1.0, self-reported by the LLM
 id                         int                — document ID
 title_quality              int | null         — LLM's assessment of the current title quality (0–100);
                                                 null for heuristic provider (no semantic scoring)
+detected_language          string | null      — language detected in the document (e.g. "Dutch", "German");
+                                                null for heuristic provider
+reasoning                  string | null      — LLM's chain-of-thought before committing to values;
+                                                null for heuristic provider
 suggested_title            string
 suggested_correspondent    SuggestedField | null   — null if LLM has no suggestion or is confident current value is correct
 suggested_document_type    SuggestedField | null   — null if LLM has no suggestion or is confident current value is correct
 suggested_tags             SuggestedTag[]
-reason                     string
+reason                     string             — human-readable summary of why changes were suggested
 ```
+
+Note: `reasoning` (internal chain-of-thought) and `reason` (human-readable summary) are distinct fields. `reasoning` is shown collapsed in the review pane for transparency; `reason` is shown prominently.
 
 ### 3.6 ApplyItem
 
@@ -326,43 +339,88 @@ Examples:
 
 ### 7.1 Ollama
 
-- Calls `POST {ollama_base_url}/api/generate` with `stream: false` and `format: "json"`.
+Uses the **Instructor** library with Ollama rather than raw `format: "json"`. Instructor provides schema-enforced structured output with automatic retry on malformed responses, and avoids the ~10× inference slowdown associated with Ollama's GBNF grammar mode.
 
-**Prompt context** — the following are passed to the model for each document:
-  - Current title
-  - Correspondent name (resolved; or `"unknown"` if unset)
-  - Document type name (resolved; or `"unknown"` if unset)
-  - Created date (ISO format; or `"unknown"` if unset)
-  - Currently applied tag names
-  - Full list of all tag names that exist in Paperless-NGX
-  - First 500 characters of OCR-extracted content (`content` field from Paperless API)
+#### Step 1 — Language detection
 
-**Prompt context** — the following are also passed so the model can suggest correspondent and document type:
-  - Full list of all correspondent names that exist in Paperless-NGX
-  - Full list of all document type names that exist in Paperless-NGX
+Before calling the main model, a lightweight language detection step determines the document's primary language from the first 500 characters of OCR content. This is performed using the `langdetect` Python library (fast, no model call required). The detected language name (e.g. `"Dutch"`, `"German"`) is passed into the main prompt so the model knows which language to write the title in.
 
-**Prompt instruction** (summary):
-> You improve document metadata for a Paperless-NGX archive. Generate a sentence case title of 3–6 words describing only the specific subject of the document — do not include the correspondent, document type, or date as these are stored separately. Prefer existing tags over creating new ones. If the current correspondent or document type appears incorrect or missing, suggest the best match from the provided lists only — do not invent new ones. Express confidence in each suggestion.
+If detection fails or is ambiguous, the language is passed as `"unknown"` and the model is instructed to match the language of the document content.
 
-**Expected JSON response**:
-  ```json
-  {
-    "title_quality": 45,
-    "suggested_title": "string",
-    "suggested_correspondent": { "name": "string", "confidence": 0.0 },
-    "suggested_document_type": { "name": "string", "confidence": 0.0 },
-    "suggested_tags": [
-      { "name": "string", "confidence": 0.0 }
-    ],
-    "reason": "string"
-  }
-  ```
+#### Step 2 — Metadata extraction prompt
 
-- `title_quality` (0–100): the model's assessment of how good the *current* title is. Stored as `llm_quality`.
-- `suggested_correspondent` and `suggested_document_type`: omit (or set to `null`) if the current value is already correct or the model is not confident. The backend validates that the suggested name exists in Paperless-NGX (case-insensitive); invalid suggestions are discarded.
-- `confidence` per tag (0.0–1.0): self-reported. The prompt instructs the model to prefer existing tags (high confidence) and only propose new ones when genuinely warranted.
-- The backend marks each tag as `is_new: true` if its name is absent from the Paperless-NGX tag map (case-insensitive).
-- Falls back to heuristic on any error (network, non-200, malformed JSON). The UI shows a warning indicator on the affected row.
+The system prompt follows this structure (format constraints first, then schema, then examples, then negative constraints):
+
+```
+## Output format
+Respond with a single valid JSON object. No text outside the JSON.
+
+## JSON schema
+{
+  "reasoning":             string   -- 1–2 sentences: how you determined each field
+  "title_quality":         int      -- 0–100: quality of the CURRENT title
+  "suggested_title":       string   -- sentence case, 3–6 words, in {LANGUAGE}
+  "suggested_correspondent": { "name": string, "confidence": float } | null
+  "suggested_document_type": { "name": string, "confidence": float } | null
+  "suggested_tags":        [ { "name": string, "confidence": float } ]
+  "reason":                string   -- one sentence summary for the user
+}
+
+## Allowed values
+Tags (select from this list only):         {ALL_TAG_NAMES}
+Correspondents (select from this list only): {ALL_CORRESPONDENT_NAMES}
+Document types (select from this list only): {ALL_DOCUMENT_TYPE_NAMES}
+
+## Examples
+{FEW_SHOT_EXAMPLES}
+
+## Rules
+- Title must be sentence case (first word capitalised, rest lowercase) in {LANGUAGE}
+- Title must be 3–6 words
+- Title must describe the subject only — do not include the correspondent,
+  document type, date, or reference numbers; these are stored separately
+- Only suggest a correspondent, document type, or tag if it is in the lists above
+- Set suggested_correspondent and suggested_document_type to null if the
+  current value is already appropriate or you are not confident
+- Confidence is 0.0–1.0; be conservative; discount your certainty by 20% if unsure
+- Do not invent new tags, correspondents, or document types
+
+## Do not
+- Include markdown, commentary, or any text outside the JSON
+- Add fields not in the schema
+- Translate the title; keep it in {LANGUAGE}
+```
+
+**Document context passed in the user message**:
+- Current title
+- Correspondent (resolved name or `"unknown"`)
+- Document type (resolved name or `"unknown"`)
+- Created date (ISO format or `"unknown"`)
+- Currently applied tags
+- First 500 characters of OCR content
+
+#### Few-shot examples
+
+Examples in the prompt are drawn from the user's own library where available:
+
+- **Sufficient library examples** (≥ `few_shot_min_documents` documents with `suggestion_status = "done"` and at least one field applied): 2–3 documents are selected from this pool, preferring variety of document type and correspondent.
+- **Insufficient library examples**: 2–3 generic built-in examples are used instead (hard-coded in the application, covering common document types).
+
+The prompt always contains exactly 2–3 examples. Library examples are more effective because they reflect the user's actual naming conventions.
+
+#### Confidence discount
+
+All `confidence` values returned by the model are reduced by `confidence_discount` (default `0.2`) before being used in the UI threshold logic (e.g. the 0.8 threshold for defaulting the "Create & apply" toggle on new tags).
+
+#### Backend validation
+
+After parsing the Instructor response, the backend validates:
+- `suggested_title` word count is between 1 and 10 (reject if outside range)
+- `suggested_correspondent.name` exists in the Paperless-NGX correspondent map (case-insensitive); discard if not
+- `suggested_document_type.name` exists in the Paperless-NGX document type map (case-insensitive); discard if not
+- `suggested_tags` entries with `is_new: false` must exist in the tag map (case-insensitive); discard invalid ones
+
+Falls back to heuristic on any unrecoverable error (network failure, Instructor retry exhausted, schema validation failed). The UI shows a ⚠️ warning indicator on the affected row.
 
 ### 7.2 Heuristic
 
@@ -459,6 +517,8 @@ Clicking any table row opens a right-side panel:
   - Applied fields show a ✓; rejected fields show a strikethrough and no longer display their Apply/Reject buttons.
   - **Apply all remaining** button at the top applies all still-undecided suggested fields in one action.
   - **Reject all remaining** button rejects all still-undecided fields.
+  - A collapsible **"Model reasoning"** section shows the `reasoning` field for transparency. Collapsed by default.
+  - Detected language shown as a small label (e.g. `🌐 Dutch`).
   - Closing the pane returns to the full table; field states are preserved in client-side memory for the duration of the session (lost on page refresh).
 - Approval state (which fields are applied/rejected) is shared between the table and the review pane.
 
@@ -530,12 +590,14 @@ The Docker Compose `stop_grace_period` must be set to at least the Ollama timeou
 
 **Layout**
 - Header with page title and Back link.
-- Form: one field per setting (see §3.1), Save button.
-- Status line below form.
+- Form grouped into two sections:
+  - **Paperless-NGX connection**: base URL, API token
+  - **Suggestion provider**: provider selector, Ollama base URL, Ollama model, temperature, confidence discount, few-shot minimum documents count
+- Save button, status line below.
 
 **Behaviour**
-- On load: fetches current settings and populates form fields.
-- On submit: POSTs form values, shows "Settings saved." or error.
+- On load: fetches current settings and populates form fields. Token shown as `***`.
+- On submit: POSTs form values; token only updated if value differs from `***`; shows "Settings saved." or error.
 
 ---
 
@@ -559,9 +621,17 @@ The Docker Compose `stop_grace_period` must be set to at least the Ollama timeou
 
 ### 9.2 Ollama
 
-- **Endpoint**: `POST /api/generate`
-- **Timeout**: 60 seconds (longer than Paperless calls due to inference time).
-- **Expected response field**: `response` (string containing JSON).
+- **Client**: Instructor library (`instructor` + `ollama` Python packages) rather than raw `httpx`. Instructor enforces the response schema and retries on malformed output.
+- **Endpoint**: `POST /api/chat` (Instructor uses the chat endpoint).
+- **Temperature**: `ollama_temperature` setting (default `0.0`) for deterministic output.
+- **Timeout**: 60 seconds per document.
+
+### 9.3 Language detection
+
+- **Library**: `langdetect` (Python package, no model call required).
+- Run on the first 500 characters of `content` from the Paperless document object.
+- Returns a language name string (e.g. `"Dutch"`, `"German"`, `"English"`).
+- If detection raises an exception or returns low-confidence result, passes `"unknown"` to the prompt.
 
 ---
 
@@ -569,6 +639,7 @@ The Docker Compose `stop_grace_period` must be set to at least the Ollama timeou
 
 - Docker image based on `python:3.12-slim`.
 - Single `paperless-cleaner` service, port `8080`.
+- Additional Python dependencies: `instructor`, `langdetect`.
 - `app/settings.json` bind-mounted from host for persistence. **Must be created (`touch app/settings.json`) before first `docker compose up`.**
 - `llm_quality` scores and `suggestion_status` are persisted in `settings.json` keyed by document ID so they survive restarts. Structure:
   ```json
