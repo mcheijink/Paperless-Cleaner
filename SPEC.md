@@ -50,6 +50,7 @@ tags               string[]        — resolved tag names (not IDs)
 heuristic_quality  int             — 0–100, see §5 tier 1
 llm_quality        int | null      — 0–100, see §5 tier 2; null until LLM has been run
 suggestion_status  string          — "none" | "pending" | "ready" | "applied"
+metadata_reviewed  string | null   — ISO date when metadata was last changed by this tool; null if never touched
 ```
 
 ### 3.3 SuggestedTag
@@ -183,9 +184,11 @@ Applies a list of approved changes back to Paperless-NGX, optionally creating ne
 
 **Behaviour**:
 - Fetches the current tag map from Paperless-NGX to resolve tag names → IDs.
+- Resolves the `"Metadata reviewed"` custom field ID (see §9.1); creates the field if it does not exist.
 - For each name in `tags_new`, creates the tag via `POST /api/tags/` and adds the new ID to the set to apply.
 - Tags in `tags` not found in Paperless-NGX are dropped (should not occur if the UI is correct).
 - Only includes non-null fields in the `PATCH` payload per document.
+- Always includes `"Metadata reviewed"` set to today's ISO date in the `PATCH` payload, regardless of which fields were changed.
 - Updates `suggestion_status` to `"applied"` for each successfully updated document.
 
 **Response**
@@ -350,7 +353,9 @@ Local, offline. No external calls.
                                         [Document pane]   │
 ```
 
-**Columns**: ☑ (select) | Status | Title | Correspondent | Document type | Date | Tags | Quality
+**Columns**: ☑ (select) | Status | Title | Correspondent | Document type | Date | Tags | Quality | Reviewed
+
+The **Reviewed** column shows the `metadata_reviewed` date (or empty if never touched by this tool).
 
 When "Show suggestions" is active, two additional columns appear between the originals and Quality: **Suggested title** | **Suggested tags**.
 
@@ -365,6 +370,7 @@ Clicking any column header opens a dropdown containing:
   - *Tags*: checkbox list of all tag names — a document matches if it has any of the checked tags
   - *Quality*: range slider (min / max)
   - *Date*: date range picker (from / to)
+  - *Reviewed*: date range picker, plus a "Never reviewed" checkbox to show only untouched documents
 - **Clear filter** — removes the filter for this column
 
 Active filters are shown as removable chips in a filter bar above the table. A "Clear all filters" button removes all at once. Filtering and sorting are applied client-side on the loaded dataset — no re-fetch required.
@@ -489,7 +495,9 @@ The Docker Compose `stop_grace_period` must be set to at least the Ollama timeou
   - `GET /api/correspondents/` — fetch all correspondents (to resolve IDs → names)
   - `GET /api/document_types/` — fetch all document types (to resolve IDs → names)
   - `POST /api/tags/` — create a new tag
-  - `PATCH /api/documents/{id}/` — update a document
+  - `GET /api/custom_fields/` — fetch all custom fields (to resolve the "Metadata reviewed" field ID)
+  - `POST /api/custom_fields/` — create the "Metadata reviewed" date field if it does not exist
+  - `PATCH /api/documents/{id}/` — update a document (includes custom field value)
   - `GET /api/documents/{id}/thumb/` — proxied for thumbnail display (see §4.10)
   - `GET /api/documents/{id}/preview/` — proxied for PDF preview (see §4.11)
 
