@@ -91,18 +91,20 @@ Returns the main page (HTML).
 Returns the settings page (HTML).
 
 ### 4.3 `GET /api/settings`
-Returns the current settings object (all fields).
+Returns the current settings object. The `paperless_token` value is masked — the actual token is never transmitted to the browser.
 
 **Response**
 ```json
 {
   "paperless_base_url": "http://...",
-  "paperless_token": "...",
+  "paperless_token": "***",
   "ollama_base_url": "http://...",
   "ollama_model": "llama3.1",
   "suggestion_provider": "ollama"
 }
 ```
+
+The settings page uses the masked value solely to indicate that a token is configured. Submitting the settings form only updates the token if the submitted value is not `"***"`.
 
 ### 4.4 `POST /api/settings`
 Saves new settings to `app/settings.json`.
@@ -425,6 +427,17 @@ Ollama can only process one document at a time (single GPU, serial inference). S
 ## 11. Open questions / future considerations
 
 1. **Task queue persistence**: the backend task queue (§8.2) lives in memory. If the container restarts mid-run, queued jobs are lost. Should the queue be persisted to `settings.json`, or is losing in-progress suggestions on restart acceptable?
-2. **Paperless-NGX token security**: the token is stored in plaintext in `settings.json` and returned by `GET /api/settings`. Access to the app should be restricted at the network level.
+2. **Paperless-NGX token security**: the token is stored in plaintext in `settings.json`. `GET /api/settings` masks the value as `"***"` so it is never transmitted to the browser. Access to the app itself should be restricted at the network level — do not expose port 8080 beyond a trusted local network.
 3. **Filtering**: no way to filter by tag, date range, or quality threshold — only sorting is supported.
 4. **Select all**: no "select all" checkbox in the document table.
+
+---
+
+## 12. Future nice-to-haves
+
+These are out of scope for the current implementation but worth revisiting later.
+
+1. **App-level authentication**: a password configured in settings that gates access to the entire UI. Useful if the app is reachable beyond a trusted local network.
+2. **Filtering**: filter the document list by tag, correspondent, document type, quality threshold, or date range.
+3. **Select all**: a "select all" checkbox to queue the entire visible document list for suggestion generation.
+4. **Task queue persistence**: survive container restarts without losing queued suggestion jobs.
