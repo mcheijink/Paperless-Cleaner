@@ -182,10 +182,8 @@ Score is an integer in the range 0–100, computed locally from title and tags.
 Local, offline. No external calls.
 
 - **Title**: capitalises each word, replaces underscores with spaces.
-- **Tags**: returns the document's existing tags unchanged. If none, returns `["review-needed"]`.
-- **Reason**: fixed string `"Title normalized and ensured at least one meaningful tag."`
-
-> **Open question**: The heuristic tag logic is not very useful — it suggests whatever tags already exist. Should it instead suggest tags based on title keywords, or pull from a fixed vocabulary of common tags?
+- **Tags**: not modified — returns the document's existing tags unchanged. Tag improvements require an LLM with access to document content; the heuristic provider does not attempt them.
+- **Reason**: fixed string `"Title normalized. Tag suggestions require an LLM provider."`
 
 ---
 
@@ -257,8 +255,7 @@ Local, offline. No external calls.
 
 1. **Batch Ollama calls**: currently one HTTP round-trip per document. Could be parallelised with `asyncio.gather`.
 2. **Tag creation**: if an Ollama-suggested tag doesn't exist in Paperless-NGX, it is silently dropped. Should the app offer to create missing tags?
-3. **Heuristic tag logic**: see §6.2 — currently not useful.
-4. **Quality score tuning**: see §5 — are current thresholds appropriate?
+3. **Quality score tuning**: see §5 — are current thresholds appropriate?
 5. **Loading states**: the UI has no spinner or disabled state during API calls; rapid clicks could cause race conditions.
 6. **Paperless-NGX token security**: the token is stored in plaintext in `settings.json` and returned by `GET /api/settings`. Access to the app should be restricted at the network level.
 7. **Filtering**: no way to filter by tag, date range, or quality threshold — only sorting is supported.
