@@ -47,21 +47,30 @@ tags      string[]   — resolved tag names (not IDs)
 quality   int        — 0–100, see §5
 ```
 
-### 3.3 Suggestion
+### 3.3 SuggestedTag
 
 ```
-id                int     — document ID
+name          string   — tag name
+confidence    float    — 0.0–1.0, self-reported by the LLM
+is_new        bool     — true if the tag does not exist in Paperless-NGX
+```
+
+### 3.4 Suggestion
+
+```
+id                int             — document ID
 suggested_title   string
-suggested_tags    string[]
+suggested_tags    SuggestedTag[]
 reason            string
 ```
 
-### 3.4 ApplyItem
+### 3.5 ApplyItem
 
 ```
-id      int
-title   string
-tags    string[]
+id          int
+title       string
+tags        string[]   — names of existing tags to apply
+tags_new    string[]   — names of new tags to create and apply
 ```
 
 ---
@@ -117,39 +126,46 @@ Generates metadata suggestions for the given document IDs.
 { "ids": [1, 2, 3] }
 ```
 
-**Response**: array of Suggestion objects (see §3.3).
+**Response**: array of Suggestion objects (see §3.4).
 
 **Behaviour**:
-- Fetches fresh document data and tag map from Paperless-NGX.
+- Fetches fresh document data and full tag map from Paperless-NGX.
 - For each ID, calls the configured suggestion provider.
+- Each SuggestedTag includes `is_new: true` if the tag name is not in the Paperless-NGX tag map.
 - If provider is `"ollama"` and the Ollama call fails, falls back to heuristic silently.
 - Documents not found in Paperless-NGX are skipped (no error).
 
 **Error**: `502` if Paperless-NGX is unreachable.
 
 ### 4.7 `POST /api/apply`
-Applies a list of approved changes back to Paperless-NGX.
+Applies a list of approved changes back to Paperless-NGX, optionally creating new tags first.
 
 **Request body**
 ```json
 {
   "entries": [
-    { "id": 1, "title": "New Title", "tags": ["tag-a", "tag-b"] }
+    {
+      "id": 1,
+      "title": "New Title",
+      "tags": ["tag-a", "tag-b"],
+      "tags_new": ["acme-corp"]
+    }
   ]
 }
 ```
 
 **Behaviour**:
 - Fetches the current tag map from Paperless-NGX to resolve tag names → IDs.
-- Tags not found in Paperless-NGX are silently dropped.
+- For each name in `tags_new`, creates the tag via `POST /api/tags/` and adds the new ID to the set to apply.
+- Tags in `tags` not found in Paperless-NGX are dropped (should not occur if the UI is correct).
 - Issues a `PATCH` request per document.
 
 **Response**
 ```json
-{ "status": "ok", "updated": 3 }
+{ "status": "ok", "updated": 3, "tags_created": ["acme-corp"] }
 ```
 
-**Error**: `502` if any individual PATCH request fails.
+**Error**: `502` if any Paperless-NGX request fails.
 
 ---
 
@@ -174,7 +190,22 @@ Score is an integer in the range 0–100, computed locally from title and tags.
 ### 6.1 Ollama
 
 - Calls `POST {ollama_base_url}/api/generate` with `stream: false` and `format: "json"`.
-- Prompt instructs the model to return `{ suggested_title, suggested_tags, reason }`.
+- The prompt includes:
+  - The document's current title.
+  - The document's currently applied tags.
+  - The **full list of all tags** that exist in Paperless-NGX, so the model can prefer existing tags over inventing new ones.
+- The prompt instructs the model to return a JSON object:
+  ```json
+  {
+    "suggested_title": "string",
+    "suggested_tags": [
+      { "name": "string", "confidence": 0.0 }
+    ],
+    "reason": "string"
+  }
+  ```
+- `confidence` is a self-reported float (0.0–1.0). The prompt instructs the model to assign lower confidence to new tags and only suggest them when no existing tag is sufficient.
+- The backend marks each tag as `is_new: true` if its name is absent from the Paperless-NGX tag map (case-insensitive).
 - Falls back to heuristic on any error (network, non-200, malformed JSON).
 
 ### 6.2 Heuristic
@@ -202,8 +233,11 @@ Local, offline. No external calls.
 - Sort selector change: re-fetches with new sort parameter.
 - Refresh button: re-fetches document list.
 - Generate suggestions: POSTs selected IDs, renders suggestion cards.
-- Each card: approve checkbox (checked by default), editable title input, editable tags input (comma-separated), reason text.
-- Apply: collects approved cards, POSTs to `/api/apply`, shows success/error alert, refreshes document list.
+- Each card: approve checkbox (checked by default), editable title input, tag list with per-tag controls, reason text.
+- Each tag in the card is shown as a badge. New tags (`is_new: true`) are visually distinct (e.g. dashed border or different colour).
+- New tags with confidence ≥ 0.8 show a "Create & apply" toggle (on by default). New tags with confidence < 0.8 show the same toggle but default to off.
+- Existing tags are always applied as normal when the card is approved.
+- Apply: collects approved cards, builds `tags` (existing) and `tags_new` (new tags with "Create & apply" toggled on) per entry, POSTs to `/api/apply`, shows success/error alert including any tags created, then refreshes document list.
 
 **Error handling**
 - Failed `GET /api/entries`: displays inline error message in the table.
@@ -232,6 +266,7 @@ Local, offline. No external calls.
 - **Endpoints used**:
   - `GET /api/documents/` — fetch all documents
   - `GET /api/tags/` — fetch all tags
+  - `POST /api/tags/` — create a new tag
   - `PATCH /api/documents/{id}/` — update a document
 
 ### 8.2 Ollama
@@ -254,8 +289,7 @@ Local, offline. No external calls.
 ## 10. Open questions / future considerations
 
 1. **Batch Ollama calls**: currently one HTTP round-trip per document. Could be parallelised with `asyncio.gather`.
-2. **Tag creation**: if an Ollama-suggested tag doesn't exist in Paperless-NGX, it is silently dropped. Should the app offer to create missing tags?
-3. **Quality score tuning**: see §5 — are current thresholds appropriate?
+2. **Quality score tuning**: see §5 — are current thresholds appropriate?
 5. **Loading states**: the UI has no spinner or disabled state during API calls; rapid clicks could cause race conditions.
 6. **Paperless-NGX token security**: the token is stored in plaintext in `settings.json` and returned by `GET /api/settings`. Access to the app should be restricted at the network level.
 7. **Filtering**: no way to filter by tag, date range, or quality threshold — only sorting is supported.
