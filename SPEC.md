@@ -6,7 +6,7 @@
 
 ## 1. Purpose
 
-Paperless Cleaner is a self-hosted web application that sits alongside a Paperless-NGX instance and helps users improve the metadata quality of their document library — specifically titles and tags — through sorting, scoring, and bulk suggestion workflows.
+Paperless Cleaner is a self-hosted web application that sits alongside a Paperless-NGX instance and helps users improve the metadata quality of their document library — titles, tags, correspondents, and document types — through sorting, scoring, and bulk suggestion workflows.
 
 ---
 
@@ -41,17 +41,26 @@ Persisted in `app/settings.json`. Seeded from environment variables on first run
 ### 3.2 Entry (document as seen by the UI)
 
 ```
-id                 int
-title              string
-correspondent      string | null   — resolved name (not ID)
-document_type      string | null   — resolved name (not ID)
-date               string | null   — ISO date (created date from Paperless)
-tags               string[]        — resolved tag names (not IDs)
-heuristic_quality  int             — 0–100, see §5 tier 1
-llm_quality        int | null      — 0–100, see §5 tier 2; null until LLM has been run
-suggestion_status  string          — "none" | "pending" | "ready" | "applied"
-metadata_reviewed  string | null   — ISO date when metadata was last changed by this tool; null if never touched
+id                      int
+title                   string
+correspondent           string | null   — resolved name (not ID); displayed as "—" if null
+document_type           string | null   — resolved name (not ID); displayed as "—" if null
+date                    string | null   — ISO date (created date from Paperless)
+tags                    string[]        — resolved tag names (not IDs)
+heuristic_quality       int             — 0–100, see §5 tier 1
+llm_quality             int | null      — 0–100, see §5 tier 2; null until LLM has been run
+metadata_completeness   int             — 0–100, see §5 tier 3
+suggestion_status       string          — "none" | "pending" | "ready" | "done"
+metadata_reviewed       string | null   — ISO date when metadata was last changed by this tool; null if never touched
 ```
+
+**`suggestion_status` values:**
+- `"none"` — no suggestion has been requested for this document
+- `"pending"` — document is queued or currently being processed by Ollama
+- `"ready"` — suggestion generated; at least one suggested field is still undecided (neither applied nor rejected)
+- `"done"` — all suggested fields have been resolved (applied or rejected); no further attention needed
+
+Status transitions to `"done"` automatically when the last undecided field is either applied or rejected. It does not distinguish between "everything applied" and "everything rejected" — both mean the document is fully reviewed.
 
 ### 3.3 SuggestedTag
 
@@ -61,26 +70,40 @@ confidence    float    — 0.0–1.0, self-reported by the LLM
 is_new        bool     — true if the tag does not exist in Paperless-NGX
 ```
 
-### 3.4 Suggestion
+### 3.4 SuggestedField
+
+A single-value suggestion with a confidence score. Used for correspondent and document type.
 
 ```
-id                int             — document ID
-title_quality     int             — LLM's assessment of the current title quality (0–100)
-suggested_title   string
-suggested_tags    SuggestedTag[]
-reason            string
+name          string   — suggested value (must be an existing name in Paperless-NGX)
+confidence    float    — 0.0–1.0, self-reported by the LLM
 ```
 
-### 3.5 ApplyItem
+### 3.5 Suggestion
 
 ```
-id          int
-title       string | null    — if null, title is not updated
-tags        string[] | null  — if null, tags are not updated
-tags_new    string[]         — names of new tags to create and apply (ignored if tags is null)
+id                         int                — document ID
+title_quality              int | null         — LLM's assessment of the current title quality (0–100);
+                                                null for heuristic provider (no semantic scoring)
+suggested_title            string
+suggested_correspondent    SuggestedField | null   — null if LLM has no suggestion or is confident current value is correct
+suggested_document_type    SuggestedField | null   — null if LLM has no suggestion or is confident current value is correct
+suggested_tags             SuggestedTag[]
+reason                     string
 ```
 
-Allowing `null` for `title` and `tags` supports per-field apply from both the table comparison view and the document review pane.
+### 3.6 ApplyItem
+
+```
+id                int
+title             string | null    — if null, title is not updated
+correspondent     string | null    — if null, correspondent is not updated
+document_type     string | null    — if null, document type is not updated
+tags              string[] | null  — if null, tags are not updated
+tags_new          string[]         — names of new tags to create and apply; ignored entirely if tags is null
+```
+
+All fields except `id` are nullable. Only non-null fields are included in the Paperless-NGX PATCH payload. This supports per-field apply from both the table comparison view and the document review pane.
 
 ---
 
@@ -137,15 +160,17 @@ Generates metadata suggestions for the given document IDs.
 { "ids": [1, 2, 3] }
 ```
 
-**Response**: array of Suggestion objects (see §3.4).
+**Response**: array of Suggestion objects (see §3.5).
 
 **Behaviour**:
 - Fetches fresh document data, full tag map, correspondent map, and document type map from Paperless-NGX.
 - For each ID, calls the configured suggestion provider.
-- Each SuggestedTag includes `is_new: true` if the tag name is not in the Paperless-NGX tag map.
-- The returned `title_quality` score is stored against the document so subsequent calls to `GET /api/entries` can return it as `llm_quality`.
-- If provider is `"ollama"` and the Ollama call fails, falls back to heuristic silently.
+- Each SuggestedTag `is_new` flag is determined by case-insensitive name match against the Paperless-NGX tag map.
+- `suggested_correspondent` and `suggested_document_type` are only set to a name that already exists in Paperless-NGX (case-insensitive match). The LLM cannot create new correspondents or document types.
+- The returned `title_quality` score is stored in `settings.json` keyed by document ID so subsequent `GET /api/entries` calls can return it as `llm_quality`.
+- If provider is `"ollama"` and the Ollama call fails, falls back to heuristic. The UI shows a warning indicator on that document's row to indicate the fallback occurred.
 - Documents not found in Paperless-NGX are skipped (no error).
+- Sets `suggestion_status` to `"ready"` for each successfully processed document.
 
 **Error**: `502` if Paperless-NGX is unreachable.
 
@@ -189,7 +214,7 @@ Applies a list of approved changes back to Paperless-NGX, optionally creating ne
 - Tags in `tags` not found in Paperless-NGX are dropped (should not occur if the UI is correct).
 - Only includes non-null fields in the `PATCH` payload per document.
 - Always includes `"Metadata reviewed"` set to today's ISO date in the `PATCH` payload, regardless of which fields were changed.
-- Updates `suggestion_status` to `"applied"` for each successfully updated document.
+- Updates `suggestion_status` to `"done"` for each successfully updated document.
 
 **Response**
 ```json
@@ -212,7 +237,7 @@ Proxies the full document preview (PDF) from Paperless-NGX, streamed to avoid lo
 
 ## 5. Quality scoring
 
-Quality is tracked as two separate scores per document.
+Quality is tracked as three separate scores per document, each measuring a different dimension.
 
 ### 5.1 Heuristic quality score (tier 1)
 
@@ -259,6 +284,20 @@ Reflects semantic quality: does the title actually describe the content of the d
 
 **Sort order**: when sorting by quality, `llm_quality` is used if available; otherwise `heuristic_quality` is used as the fallback.
 
+### 5.3 Metadata completeness score (tier 3)
+
+Computed locally on every page load. Measures how many of the five key Paperless-NGX metadata fields are filled. Range: 0–100.
+
+| Field | Points | Condition |
+|---|---|---|
+| Title | 20 | Non-empty and not a filename pattern (heuristic_quality > 0) |
+| Tags | 20 | At least one tag assigned |
+| Correspondent | 20 | Not null |
+| Document type | 20 | Not null |
+| Date | 20 | Not null |
+
+A document with all five fields populated scores 100. This score is complementary to the quality scores — a document can have a perfect title quality score but still score 40% on completeness if correspondent and document type are missing.
+
 ---
 
 ## 6. Title convention
@@ -298,14 +337,20 @@ Examples:
   - Full list of all tag names that exist in Paperless-NGX
   - First 500 characters of OCR-extracted content (`content` field from Paperless API)
 
+**Prompt context** — the following are also passed so the model can suggest correspondent and document type:
+  - Full list of all correspondent names that exist in Paperless-NGX
+  - Full list of all document type names that exist in Paperless-NGX
+
 **Prompt instruction** (summary):
-> You improve document metadata for a Paperless-NGX archive. The correspondent, document type, and date are already stored as separate fields — do not include them in the title. Generate a sentence case title of 3–6 words describing only the specific subject of the document. Prefer existing tags over creating new ones; only suggest a new tag if no existing tag is adequate.
+> You improve document metadata for a Paperless-NGX archive. Generate a sentence case title of 3–6 words describing only the specific subject of the document — do not include the correspondent, document type, or date as these are stored separately. Prefer existing tags over creating new ones. If the current correspondent or document type appears incorrect or missing, suggest the best match from the provided lists only — do not invent new ones. Express confidence in each suggestion.
 
 **Expected JSON response**:
   ```json
   {
     "title_quality": 45,
     "suggested_title": "string",
+    "suggested_correspondent": { "name": "string", "confidence": 0.0 },
+    "suggested_document_type": { "name": "string", "confidence": 0.0 },
     "suggested_tags": [
       { "name": "string", "confidence": 0.0 }
     ],
@@ -313,18 +358,22 @@ Examples:
   }
   ```
 
-- `title_quality` (0–100): the model's assessment of how good the *current* title is. This is stored as `llm_quality` on the document entry.
-- `confidence` per tag (0.0–1.0): self-reported. The prompt instructs the model to prefer existing tags (high confidence) and only propose new ones when genuinely warranted (which should result in lower confidence scores for invented tags).
+- `title_quality` (0–100): the model's assessment of how good the *current* title is. Stored as `llm_quality`.
+- `suggested_correspondent` and `suggested_document_type`: omit (or set to `null`) if the current value is already correct or the model is not confident. The backend validates that the suggested name exists in Paperless-NGX (case-insensitive); invalid suggestions are discarded.
+- `confidence` per tag (0.0–1.0): self-reported. The prompt instructs the model to prefer existing tags (high confidence) and only propose new ones when genuinely warranted.
 - The backend marks each tag as `is_new: true` if its name is absent from the Paperless-NGX tag map (case-insensitive).
-- Falls back to heuristic on any error (network, non-200, malformed JSON).
+- Falls back to heuristic on any error (network, non-200, malformed JSON). The UI shows a warning indicator on the affected row.
 
 ### 7.2 Heuristic
 
 Local, offline. No external calls.
 
-- **Title**: capitalises each word, replaces underscores with spaces.
-- **Tags**: not modified — returns the document's existing tags unchanged. Tag improvements require an LLM with access to document content; the heuristic provider does not attempt them.
-- **Reason**: fixed string `"Title normalized. Tag suggestions require an LLM provider."`
+- **Title**: capitalises each word and replaces underscores with spaces. Word boundaries are spaces only — hyphens are not treated as separators.
+- **Tags**: not modified — returns the document's existing tags unchanged. Tag improvements require an LLM with access to document content.
+- **Correspondent**: not modified — no suggestion.
+- **Document type**: not modified — no suggestion.
+- **`title_quality`**: returns `null` — the heuristic has no semantic understanding of title quality.
+- **Reason**: fixed string `"Title normalized. Correspondent, document type, and tag suggestions require an LLM provider."`
 
 ---
 
@@ -353,9 +402,12 @@ Local, offline. No external calls.
                                         [Document pane]   │
 ```
 
-**Columns**: ☑ (select) | Status | Title | Correspondent | Document type | Date | Tags | Quality | Reviewed
+**Columns**: ☑ (select) | Status | Title | Correspondent | Document type | Date | Tags | Quality | Completeness | Reviewed
 
-The **Reviewed** column shows the `metadata_reviewed` date (or empty if never touched by this tool).
+- **Quality** shows `llm_quality` if available, otherwise `heuristic_quality`.
+- **Completeness** shows `metadata_completeness` (0–100).
+- **Reviewed** shows the `metadata_reviewed` date (or empty if never touched by this tool).
+- `null` values for correspondent, document type, and date are displayed as `—`.
 
 When "Show suggestions" is active, two additional columns appear between the originals and Quality: **Suggested title** | **Suggested tags**.
 
@@ -379,19 +431,21 @@ Active filters are shown as removable chips in a filter bar above the table. A "
 
 Each row has a coloured status dot in the Status column:
 
-| Dot | Meaning |
-|---|---|
-| ⚪ Grey | No suggestion requested |
-| 🟡 Yellow | Queued or being processed by Ollama |
-| 🟢 Green | Suggestion ready, not yet applied |
-| 🔵 Blue | Suggestion has been applied |
+| Dot | Status | Meaning |
+|---|---|---|
+| ⚪ Grey | `none` | No suggestion requested |
+| 🟡 Yellow | `pending` | Queued or being processed by Ollama |
+| 🟢 Green | `ready` | Suggestion generated; at least one field still undecided |
+| 🔵 Blue | `done` | All suggested fields resolved (applied or rejected); no attention needed |
+| ⚠️ Orange | — | Ollama failed; heuristic fallback was used |
 
 #### Show suggestions toggle
 
 A toolbar button **"Show suggestions (N ready)"** where N is the count of documents with `suggestion_status = "ready"`. When active:
-- The table gains **Suggested title** and **Suggested tags** columns.
-- Each suggestion cell shows the suggested value with a per-field **Apply** button and an approve checkbox.
+- The table gains **Suggested title**, **Suggested correspondent**, **Suggested document type**, and **Suggested tags** columns.
+- Each suggestion cell shows the suggested value with a per-field **Apply** button and a **Reject** (✕) button.
 - Rows without a ready suggestion show an empty cell in those columns.
+- Applied fields show a ✓ indicator; rejected fields show a strikethrough. Once all fields in a row are applied or rejected the row status updates to 🔵 "done" automatically.
 
 #### Document review pane
 
@@ -400,11 +454,13 @@ Clicking any table row opens a right-side panel:
 - **Left**: document thumbnail (from `GET /api/documents/{id}/thumb`) with a link to open the full PDF preview in a new tab (`GET /api/documents/{id}/preview`).
 - **Right**: metadata fields in a layout similar to the Paperless-NGX document view:
   - Each field shows the current value.
-  - If a suggestion is ready, the suggested value is shown directly below in a distinct style, with an **Apply** button for that field.
-  - Fields: Title, Correspondent, Document type, Date, Tags (as badges; new suggested tags show confidence and a "Create & apply" toggle).
-  - **Apply all suggestions** button at the top applies all suggested fields in one action.
-  - **Approve** checkbox — synced with the table row's approval state.
-- Closing the pane returns to the full table.
+  - If a suggestion is ready and not yet resolved, the suggested value is shown directly below in a distinct style with **Apply** and **Reject** buttons for that field.
+  - Fields: Title, Correspondent, Document type, Tags (as badges; new suggested tags show confidence and a "Create & apply" toggle).
+  - Applied fields show a ✓; rejected fields show a strikethrough and no longer display their Apply/Reject buttons.
+  - **Apply all remaining** button at the top applies all still-undecided suggested fields in one action.
+  - **Reject all remaining** button rejects all still-undecided fields.
+  - Closing the pane returns to the full table; field states are preserved in client-side memory for the duration of the session (lost on page refresh).
+- Approval state (which fields are applied/rejected) is shared between the table and the review pane.
 
 #### Approval and apply workflow
 
@@ -495,7 +551,7 @@ The Docker Compose `stop_grace_period` must be set to at least the Ollama timeou
   - `GET /api/correspondents/` — fetch all correspondents (to resolve IDs → names)
   - `GET /api/document_types/` — fetch all document types (to resolve IDs → names)
   - `POST /api/tags/` — create a new tag
-  - `GET /api/custom_fields/` — fetch all custom fields (to resolve the "Metadata reviewed" field ID)
+  - `GET /api/custom_fields/` — fetch all custom fields to resolve the "Metadata reviewed" field ID (case-insensitive name match; if a field with that name exists but has the wrong data type, a new field named "Metadata reviewed (cleaner)" is created instead)
   - `POST /api/custom_fields/` — create the "Metadata reviewed" date field if it does not exist
   - `PATCH /api/documents/{id}/` — update a document (includes custom field value)
   - `GET /api/documents/{id}/thumb/` — proxied for thumbnail display (see §4.10)
@@ -514,7 +570,21 @@ The Docker Compose `stop_grace_period` must be set to at least the Ollama timeou
 - Docker image based on `python:3.12-slim`.
 - Single `paperless-cleaner` service, port `8080`.
 - `app/settings.json` bind-mounted from host for persistence. **Must be created (`touch app/settings.json`) before first `docker compose up`.**
-- `llm_quality` scores and `suggestion_status` are persisted in `settings.json` keyed by document ID so they survive restarts.
+- `llm_quality` scores and `suggestion_status` are persisted in `settings.json` keyed by document ID so they survive restarts. Structure:
+  ```json
+  {
+    "paperless_base_url": "...",
+    "paperless_token": "...",
+    "ollama_base_url": "...",
+    "ollama_model": "...",
+    "suggestion_provider": "...",
+    "document_state": {
+      "123": { "llm_quality": 45, "suggestion_status": "done" },
+      "124": { "llm_quality": null, "suggestion_status": "ready" }
+    }
+  }
+  ```
+- Field-level apply/reject state (which fields are applied or rejected per document) is **not** persisted — it is held in client-side memory only and is lost on page refresh. Only the final `suggestion_status` transition to `"done"` is persisted.
 - `stop_grace_period: 70s` — allows the in-flight Ollama request (60 s timeout) to be cancelled cleanly before Docker sends SIGKILL.
 - Auto-restart unless stopped.
 
