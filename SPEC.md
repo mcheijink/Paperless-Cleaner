@@ -143,7 +143,23 @@ Generates metadata suggestions for the given document IDs.
 
 **Error**: `502` if Paperless-NGX is unreachable.
 
-### 4.7 `POST /api/apply`
+### 4.7 `GET /api/suggestions/status?job_id=<id>`
+Returns the current state of a suggestion job.
+
+**Response**
+```json
+{ "job_id": "abc123", "total": 5, "completed": 2, "results": [ ...Suggestion objects... ] }
+```
+
+### 4.8 `DELETE /api/suggestions/queue`
+Cancels all pending (not yet started) items in the suggestion queue. The document currently being processed by Ollama completes normally.
+
+**Response**
+```json
+{ "status": "ok", "cancelled": 3 }
+```
+
+### 4.9 `POST /api/apply`
 Applies a list of approved changes back to Paperless-NGX, optionally creating new tags first.
 
 **Request body**
@@ -307,19 +323,61 @@ Local, offline. No external calls.
 - On load: fetches and renders the document list.
 - Sort selector change: re-fetches with new sort parameter.
 - Refresh button: re-fetches document list.
-- Generate suggestions: POSTs selected IDs, renders suggestion cards.
+- Generate suggestions: adds selected IDs to the suggestion task queue (see §8.3); suggestion cards render progressively as results arrive.
 - Each card: approve checkbox (checked by default), editable title input, tag list with per-tag controls, reason text.
 - Each tag in the card is shown as a badge. New tags (`is_new: true`) are visually distinct (e.g. dashed border or different colour).
 - New tags with confidence ≥ 0.8 show a "Create & apply" toggle (on by default). New tags with confidence < 0.8 show the same toggle but default to off.
 - Existing tags are always applied as normal when the card is approved.
 - Apply: collects approved cards, builds `tags` (existing) and `tags_new` (new tags with "Create & apply" toggled on) per entry, POSTs to `/api/apply`, shows success/error alert including any tags created, then refreshes document list.
 
+**Loading states**
+- **Paperless-NGX calls** (expected < 2 s): buttons that trigger a Paperless request are disabled and show a spinner label (e.g. "Refreshing…") for the duration. A new request cannot be triggered until the previous one completes.
+- **Ollama calls** (may take 10–30 s per document): handled via the task queue (§8.3). The "Generate suggestions" button is disabled while the queue is non-empty. A progress indicator shows "Processing 2 of 5…" updating as each document completes.
+- **Apply**: the "Apply approved changes" button is disabled until at least one suggestion card is approved, and again while the apply request is in flight.
+
 **Error handling**
 - Failed `GET /api/entries`: displays inline error message in the table.
-- Failed `POST /api/suggestions`: displays alert.
-- Failed `POST /api/apply`: displays alert.
+- Failed suggestion (single document): the card for that document shows an error state; other cards are unaffected.
+- Failed `POST /api/apply`: displays inline error; successfully applied entries are still reflected on refresh.
 
-### 8.2 Settings page (`/settings`)
+### 8.2 Request handling and task queue architecture
+
+Different external calls have very different latency profiles and must be handled accordingly.
+
+#### Paperless-NGX requests (fast, < 2 s expected)
+
+- Triggered directly in response to user actions (page load, refresh, apply).
+- Concurrent requests to the same endpoint are blocked — a new request cannot start until the previous one resolves.
+- UI buttons are disabled for the duration; a spinner label indicates activity.
+- Errors surface immediately as inline messages.
+
+#### Ollama requests (slow, 10–30 s per document)
+
+Ollama can only process one document at a time (single GPU, serial inference). Sending multiple requests concurrently would queue them inside Ollama anyway, with no benefit. The architecture therefore uses an explicit **backend task queue**:
+
+**Backend (FastAPI)**
+- `POST /api/suggestions` no longer blocks until all documents are processed. Instead it enqueues the requested document IDs and returns immediately with a `job_id`.
+- A background worker (Python `asyncio` task) pulls one document ID at a time from the queue, calls Ollama, and stores the result.
+- Two new endpoints expose queue state:
+  - `GET /api/suggestions/status?job_id=<id>` — returns `{ total, completed, results: [...] }` where `results` grows as documents finish.
+  - `DELETE /api/suggestions/queue` — cancels all pending items (does not interrupt the in-flight Ollama call).
+
+**Frontend**
+- After POSTing to `/api/suggestions`, the frontend polls `GET /api/suggestions/status` every 2 seconds.
+- Each completed result is rendered as a suggestion card immediately (progressive rendering).
+- The progress indicator shows `"Processing N of M…"` and updates with each poll.
+- Polling stops when `completed == total` or the user navigates away.
+- The "Generate suggestions" button is disabled while `completed < total`.
+
+#### Apply requests (fast, one PATCH per document)
+
+- Sent as a single `POST /api/apply` with all approved entries.
+- The apply button is disabled until at least one card is approved and while the request is in flight.
+- Errors are shown inline; the document list is refreshed on success.
+
+---
+
+### 8.3 Settings page (`/settings`)
 
 **Layout**
 - Header with page title and Back link.
@@ -366,8 +424,7 @@ Local, offline. No external calls.
 
 ## 11. Open questions / future considerations
 
-1. **Batch Ollama calls**: currently one HTTP round-trip per document. Could be parallelised with `asyncio.gather`.
-2. **Loading states**: the UI has no spinner or disabled state during API calls; rapid clicks could cause race conditions.
-3. **Paperless-NGX token security**: the token is stored in plaintext in `settings.json` and returned by `GET /api/settings`. Access to the app should be restricted at the network level.
-4. **Filtering**: no way to filter by tag, date range, or quality threshold — only sorting is supported.
-5. **Select all**: no "select all" checkbox in the document table.
+1. **Task queue persistence**: the backend task queue (§8.2) lives in memory. If the container restarts mid-run, queued jobs are lost. Should the queue be persisted to `settings.json`, or is losing in-progress suggestions on restart acceptable?
+2. **Paperless-NGX token security**: the token is stored in plaintext in `settings.json` and returned by `GET /api/settings`. Access to the app should be restricted at the network level.
+3. **Filtering**: no way to filter by tag, date range, or quality threshold — only sorting is supported.
+4. **Select all**: no "select all" checkbox in the document table.
