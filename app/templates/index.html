@@ -9,43 +9,89 @@
   <body>
     <header>
       <h1>Paperless Cleaner</h1>
-      <nav>
-        <a href="/settings">Settings</a>
-      </nav>
+      <nav><a href="/settings">Settings</a></nav>
     </header>
 
-    <main>
+    <main id="mainLayout">
+      <!-- Toolbar -->
       <section class="toolbar">
-        <label>Sort by
-          <select id="sortBy">
-            <option value="name">Name</option>
-            <option value="tags">Tags</option>
-            <option value="quality">Quality</option>
-          </select>
-        </label>
         <button id="refreshBtn">Refresh</button>
         <button id="suggestBtn">Generate suggestions</button>
+        <button id="showSuggestBtn" class="btn-secondary" style="display:none">Show suggestions (<span id="readyCount">0</span> ready)</button>
+        <button id="applyAllBtn" class="btn-success" disabled>Apply all approved (<span id="approvedCount">0</span>)</button>
+        <button id="cancelQueueBtn" class="btn-danger" style="display:none">Cancel queue</button>
       </section>
 
-      <section>
-        <table>
-          <thead>
-            <tr>
-              <th>Select</th>
-              <th>Title</th>
-              <th>Tags</th>
-              <th>Quality</th>
-            </tr>
-          </thead>
-          <tbody id="entryRows"></tbody>
-        </table>
+      <!-- Progress bar -->
+      <section id="progressSection" style="display:none">
+        <div class="progress-bar-track">
+          <div class="progress-bar-fill" id="progressFill"></div>
+        </div>
+        <span id="progressLabel" class="progress-label"></span>
       </section>
 
-      <section>
-        <h2>Suggestions</h2>
-        <div id="suggestions"></div>
-        <button id="applyBtn">Apply approved changes</button>
+      <!-- Active filters -->
+      <section id="filterChips" class="filter-chips" style="display:none">
+        <span class="chips-label">Active filters:</span>
+        <span id="chipsContainer"></span>
+        <button id="clearAllFilters" class="chip-clear-all">Clear all</button>
       </section>
+
+      <!-- Table + Review pane wrapper -->
+      <div id="tableAndPane">
+        <!-- Main table -->
+        <section id="tableSection">
+          <table id="mainTable">
+            <thead>
+              <tr id="tableHeaderRow">
+                <th class="col-check"><input type="checkbox" id="selectAll" title="Select all visible" /></th>
+                <th data-col="status" class="sortable">Status <span class="sort-arrow"></span></th>
+                <th data-col="title" class="sortable filterable">Title <span class="sort-arrow"></span></th>
+                <th data-col="correspondent" class="sortable filterable">Correspondent <span class="sort-arrow"></span></th>
+                <th data-col="document_type" class="sortable filterable">Document type <span class="sort-arrow"></span></th>
+                <th data-col="date" class="sortable filterable">Date <span class="sort-arrow"></span></th>
+                <th data-col="tags" class="filterable">Tags <span class="sort-arrow"></span></th>
+                <th data-col="quality" class="sortable filterable">Quality <span class="sort-arrow"></span></th>
+                <th data-col="metadata_completeness" class="sortable">Completeness <span class="sort-arrow"></span></th>
+                <th data-col="metadata_reviewed" class="sortable filterable">Reviewed <span class="sort-arrow"></span></th>
+                <!-- Suggestion columns — added/removed by JS -->
+              </tr>
+            </thead>
+            <tbody id="entryRows"></tbody>
+          </table>
+        </section>
+
+        <!-- Review pane -->
+        <aside id="reviewPane" class="review-pane" style="display:none">
+          <div class="pane-header">
+            <strong id="paneTitle">Document</strong>
+            <button id="closePaneBtn" class="btn-icon" title="Close">✕</button>
+          </div>
+          <div class="pane-thumb">
+            <img id="paneThumb" src="" alt="Thumbnail" />
+            <a id="panePreviewLink" href="#" target="_blank" rel="noopener">Open PDF ↗</a>
+          </div>
+          <div class="pane-fields" id="paneFields"></div>
+          <div class="pane-actions">
+            <button id="paneApplyAllBtn" class="btn-success" style="display:none">Apply all remaining</button>
+            <button id="paneRejectAllBtn" class="btn-danger" style="display:none">Reject all remaining</button>
+          </div>
+          <details id="paneReasoning" style="display:none">
+            <summary>Model reasoning</summary>
+            <p id="paneReasoningText" class="reasoning-text"></p>
+          </details>
+        </aside>
+      </div>
+
+      <!-- Column filter dropdown (shared, moved by JS) -->
+      <div id="columnFilterDropdown" class="col-filter-dropdown" style="display:none">
+        <div id="dropdownSortSection">
+          <button id="sortAscBtn">Sort ascending ↑</button>
+          <button id="sortDescBtn">Sort descending ↓</button>
+        </div>
+        <div id="dropdownFilterSection"></div>
+        <button id="clearColFilterBtn" class="chip-clear-all">Clear filter</button>
+      </div>
     </main>
 
     <script src="/static/app.js"></script>

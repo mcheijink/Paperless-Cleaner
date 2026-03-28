@@ -3,29 +3,61 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Settings - Paperless Cleaner</title>
+    <title>Settings — Paperless Cleaner</title>
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
     <header>
       <h1>Settings</h1>
-      <nav><a href="/">Back</a></nav>
+      <nav><a href="/">← Back</a></nav>
     </header>
     <main>
-      <form id="settingsForm" class="card">
-        <label>Paperless Base URL<input name="paperless_base_url" required /></label>
-        <label>Paperless API Token<input name="paperless_token" /></label>
-        <label>Ollama Base URL<input name="ollama_base_url" required /></label>
-        <label>Ollama Model<input name="ollama_model" required /></label>
-        <label>Suggestion Provider
-          <select name="suggestion_provider">
-            <option value="ollama">Ollama</option>
-            <option value="heuristic">Heuristic</option>
-          </select>
-        </label>
-        <button type="submit">Save settings</button>
+      <form id="settingsForm">
+
+        <fieldset>
+          <legend>Paperless-NGX connection</legend>
+          <label>Base URL
+            <input name="paperless_base_url" required />
+          </label>
+          <label>API Token
+            <input name="paperless_token" type="password" autocomplete="off" />
+            <small>Shown as *** when a token is configured.</small>
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Suggestion provider</legend>
+          <label>Provider
+            <select name="suggestion_provider">
+              <option value="ollama">Ollama (LLM)</option>
+              <option value="heuristic">Heuristic (offline)</option>
+            </select>
+          </label>
+          <label>Ollama Base URL
+            <input name="ollama_base_url" />
+          </label>
+          <label>Ollama Model
+            <input name="ollama_model" />
+          </label>
+          <label>Temperature
+            <input name="ollama_temperature" type="number" step="0.05" min="0" max="1" />
+            <small>0.0 = deterministic. Raise slightly if model produces repetitive output.</small>
+          </label>
+          <label>Confidence discount
+            <input name="confidence_discount" type="number" step="0.05" min="0" max="1" />
+            <small>Subtracted from all LLM confidence scores. 0.2 compensates for local model overconfidence.</small>
+          </label>
+          <label>Few-shot minimum documents
+            <input name="few_shot_min_documents" type="number" min="0" step="1" />
+            <small>Minimum reviewed documents before library examples replace built-in examples in the prompt.</small>
+          </label>
+        </fieldset>
+
+        <div class="toolbar">
+          <button type="submit">Save settings</button>
+          <span id="status"></span>
+        </div>
       </form>
-      <p id="status"></p>
     </main>
     <script src="/static/settings.js"></script>
   </body>
