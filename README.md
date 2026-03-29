@@ -1,16 +1,19 @@
 # Paperless Cleaner
 
-A web application for reviewing and improving document metadata quality in [Paperless-NGX](https://docs.paperless-ngx.com/). It surfaces low-quality documents, generates title and tag suggestions (via Ollama or a local heuristic), and lets you review and apply changes in bulk.
+A self-hosted web application that sits alongside [Paperless-NGX](https://docs.paperless-ngx.com/) and helps you improve document metadata quality — titles, tags, correspondents, and document types — through quality scoring, LLM-powered suggestions, and a keyboard-driven review workflow.
 
 ## Features
 
-- List all documents from Paperless-NGX, sortable by name, tag count, or quality score
-- Quality scoring algorithm to surface documents that need attention
-- Select one or more documents for bulk metadata improvement
-- Generate title and tag suggestions using Ollama (local LLM) or a built-in heuristic
-- Review suggestions in a card UI: approve, reject, or edit before applying
-- Push accepted changes back to Paperless-NGX via its API
-- Settings page for all connection and model parameters
+- Lists all documents from Paperless-NGX with heuristic and LLM quality scores
+- Column-level filtering and sorting (Excel-style dropdown per column)
+- Generates title, tag, correspondent, and document type suggestions using Ollama (local LLM) or a built-in heuristic
+- Suggestions run in a persistent background queue — add more documents at any time without waiting for the current batch to finish
+- Modal review pane with thumbnail, per-field apply/reject, and tag diff (additions in green, removals in red)
+- Manual tags (matching algorithm = none) are never suggested for removal
+- Keyboard-driven review: `A` apply & next, `R` reject & next, `←`/`→` navigate
+- Pushes accepted changes to Paperless-NGX via its REST API
+- Stores LLM quality scores, suggestion status, and review dates as Paperless-NGX **custom fields** — visible inside Paperless itself
+- Settings page for all connection and model parameters; token masked in API responses
 
 ## Prerequisites
 
@@ -18,7 +21,7 @@ A web application for reviewing and improving document metadata quality in [Pape
 - A running [Paperless-NGX](https://docs.paperless-ngx.com/) instance with an API token
 - (Optional) A running [Ollama](https://ollama.com/) instance for AI-powered suggestions
 
-## Quick start (Docker)
+## Quick start
 
 1. Create the settings file (required before first run):
 
@@ -26,55 +29,87 @@ A web application for reviewing and improving document metadata quality in [Pape
    touch app/settings.json
    ```
 
+   > The file must exist on the host before running `docker compose up`. If it is missing, Docker creates a directory at that path instead of a file, breaking settings persistence.
+
 2. Start the container:
 
    ```bash
-   docker compose up --build
+   docker compose up --build -d
    ```
 
-3. Open `http://localhost:8080`, go to **Settings**, and configure your Paperless-NGX connection.
+3. Open `http://localhost:8200`, go to **Settings**, and configure your Paperless-NGX URL and API token.
 
-> **Note:** The `app/settings.json` file must exist on the host before running `docker compose up`. If it is missing, Docker will create a directory at that path instead of a file, breaking settings persistence.
+On first start the app auto-creates three Paperless-NGX custom fields: **LLM quality**, **Suggestion status**, and **Metadata reviewed**.
 
 ## Configuration
 
-Open `/settings` and configure the following fields. Settings are saved to `app/settings.json` and take effect immediately without a restart.
+Open `/settings` and fill in the fields below. Settings are saved to `app/settings.json` and take effect immediately without a restart. They can also be seeded from environment variables on first run.
 
-| Field | Description | Default |
-|---|---|---|
-| `Paperless Base URL` | URL of your Paperless-NGX instance | `http://paperless-ngx:8000` |
-| `Paperless API Token` | API token from Paperless-NGX | _(empty)_ |
-| `Ollama Base URL` | URL of your Ollama instance | `http://ollama:11434` |
-| `Ollama Model` | Model name to use for suggestions | `llama3.1` |
-| `Suggestion Provider` | `ollama` or `heuristic` | `ollama` |
+| Field | Description | Default | Env var |
+|---|---|---|---|
+| `Paperless Base URL` | URL of your Paperless-NGX instance | `http://paperless-ngx:8000` | `PAPERLESS_BASE_URL` |
+| `Paperless API Token` | API token from Paperless-NGX admin | _(empty)_ | `PAPERLESS_TOKEN` |
+| `Ollama Base URL` | URL of your Ollama instance | `http://ollama:11434` | `OLLAMA_BASE_URL` |
+| `Ollama Model` | Model name to use for suggestions | `llama3.1` | `OLLAMA_MODEL` |
+| `Suggestion Provider` | `ollama` or `heuristic` | `ollama` | `SUGGESTION_PROVIDER` |
+| `Temperature` | Ollama sampling temperature | `0.0` | `OLLAMA_TEMPERATURE` |
+| `Confidence discount` | Subtracted from LLM confidence scores | `0.2` | `CONFIDENCE_DISCOUNT` |
+| `Few-shot min documents` | Min reviewed docs before library examples are used | `5` | `FEW_SHOT_MIN_DOCUMENTS` |
 
-On first start, settings can also be seeded via environment variables: `PAPERLESS_BASE_URL`, `PAPERLESS_TOKEN`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `SUGGESTION_PROVIDER`.
+**Recommended Ollama model**: `qwen3:8b` (fast, good structured output). Use the `/no_think` directive or set temperature to 0 to suppress long reasoning chains.
 
-## Quality score
+## Workflow
 
-Each document is assigned a score from 0–100 based on:
+1. **Refresh** — loads all documents and quality scores.
+2. **Select** — tick checkboxes, or leave all unchecked to queue every visible document.
+3. **Generate suggestions** — queues documents for LLM processing. The progress bar shows ETA and per-document timing. Click the bar to see the full queue. You can add more documents while the queue is running.
+4. **Show suggestions** — toggle to add suggestion columns to the table with per-field Apply/Reject.
+5. **Review pane** — click any row to open. Use **Apply & Next →** or **Reject & Next →** (or keyboard shortcuts) to move through the queue efficiently.
+6. **Apply all approved** — sends all applied changes to Paperless-NGX.
 
-- **Title length** — up to 50 points (25 for ≥3 chars, 50 for ≥8 chars)
-- **Tag count** — 15 points per tag, up to 45 points
-- **Capitalisation** — 5 points if the title is not all-lowercase
+## Quality scores
 
-Documents with low scores are shown first when sorting by **Quality**.
+Three complementary scores per document:
+
+| Score | Source | Range | Description |
+|---|---|---|---|
+| `quality` | Heuristic (local) | 0–100 | Word count, casing, penalty for filename-like titles |
+| `llm_quality` | LLM (per run) | 0–100 | Semantic quality; `null` until LLM has been run |
+| `completeness` | Heuristic (local) | 0–100 | 20 pts each for: title, tags, correspondent, doc type, date |
+
+When sorting by **Quality**, `llm_quality` is used if available, otherwise `heuristic_quality`.
 
 ## Suggestion providers
 
 ### Ollama
 
-Sends document metadata to the configured Ollama model via `/api/generate` and expects a JSON response with `suggested_title`, `suggested_tags`, and `reason`. If the Ollama call fails for any reason, the app automatically falls back to the heuristic provider.
+Uses the [Instructor](https://github.com/jxnl/instructor) library with Ollama's OpenAI-compatible endpoint for schema-enforced structured output. Language is auto-detected from OCR content (via `langdetect`) and passed to the model so titles are written in the document's own language.
+
+The model is asked to suggest a 3–6 word sentence-case title, and optionally a correspondent, document type, and tags — all constrained to values that already exist in Paperless-NGX. New tags can be suggested and created on apply.
+
+Falls back to the heuristic provider on any failure; affected rows show a ⚠️ indicator.
 
 ### Heuristic
 
-A local, offline fallback. Normalises the title by capitalising each word and replacing underscores with spaces. Suggests the document's existing tags (or `review-needed` if none exist).
+Local, offline. Capitalises each word and replaces underscores with spaces. Does not suggest correspondent, document type, or tag changes.
+
+## Keyboard shortcuts (review pane)
+
+| Key | Action |
+|---|---|
+| `A` | Apply all remaining suggestions & go to next |
+| `R` | Reject all remaining & go to next |
+| `→` / `L` | Next document (without acting) |
+| `←` / `H` | Previous document (without acting) |
+| `Esc` | Close pane |
+
+The **?** button in the header opens a full help overlay.
 
 ## Development
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8080
 ```
@@ -83,15 +118,21 @@ uvicorn app.main:app --reload --port 8080
 
 ```
 app/
-  main.py           # FastAPI backend — API routes and Paperless/Ollama integration
+  main.py           # FastAPI backend — API routes, Paperless/Ollama integration, background queue
   static/
-    app.js          # Main page logic (document list, suggestions, apply)
-    settings.js     # Settings page logic
+    app.js          # Main page — document list, filtering, suggestions, review pane
+    settings.js     # Settings page
     style.css       # Dark-theme stylesheet
   templates/
     index.html      # Main page template
     settings.html   # Settings page template
 Dockerfile
-docker-compose.yml
+docker-compose.yml  # Exposes port 8200 → container 8080
 requirements.txt
 ```
+
+## Security notes
+
+- `app/settings.json` contains your Paperless API token and is gitignored — never commit it.
+- The token is masked (`***`) in all API responses to the browser.
+- The app is designed for trusted local network use. There is no built-in authentication.

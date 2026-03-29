@@ -1,15 +1,8 @@
-const rows = document.getElementById('entryRows');
-const suggestionsContainer = document.getElementById('suggestions');
-const sortBy = document.getElementById('sortBy');
-const refreshBtn = document.getElementById('refreshBtn');
-const suggestBtn = document.getElementById('suggestBtn');
-const applyBtn = document.getElementById('applyBtn');
+'use strict';
 
-let currentEntries = [];
-let currentSuggestions = [];
-
+// ── XSS helper ───────────────────────────────────────────────────────────────
 function esc(str) {
-  return String(str)
+  return String(str ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -17,103 +10,1111 @@ function esc(str) {
     .replace(/'/g, '&#39;');
 }
 
-function renderEntries(entries) {
-  rows.innerHTML = '';
-  entries.forEach((entry) => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td><input type="checkbox" data-id="${esc(entry.id)}" /></td>
-      <td>${esc(entry.title)}</td>
-      <td>${esc(entry.tags.join(', '))}</td>
-      <td>${esc(entry.quality)}</td>
-    `;
-    rows.appendChild(tr);
+// ── State ─────────────────────────────────────────────────────────────────────
+let currentEntries = [];       // all entries from last /api/entries fetch
+let filteredEntries = [];      // after client-side filter+sort
+let suggestions = new Map();   // docId → Suggestion object
+let fieldStates = new Map();   // docId → {title,correspondent,document_type,tags} → "undecided"|"applied"|"rejected"
+let approvedDocs = new Set();  // docIds with "approve" checked
+
+let activeSortCol = 'quality';
+let activeSortDir = 'asc';
+let activeFilters = {};        // colName → filter value/state
+
+let suggestionsVisible = false;
+let pollTimer = null;
+let openPaneDocId = null;
+
+let refreshInFlight = false;
+let applyInFlight = false;
+let paperlessBaseUrl = '';
+let lastQueueData = null;
+
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+const refreshBtn      = document.getElementById('refreshBtn');
+const suggestBtn      = document.getElementById('suggestBtn');
+const showSuggestBtn  = document.getElementById('showSuggestBtn');
+const applyAllBtn     = document.getElementById('applyAllBtn');
+const cancelQueueBtn  = document.getElementById('cancelQueueBtn');
+const readyCountEl    = document.getElementById('readyCount');
+const approvedCountEl = document.getElementById('approvedCount');
+const progressSection = document.getElementById('progressSection');
+const progressTrack   = document.getElementById('progressTrack');
+const progressFill    = document.getElementById('progressFill');
+const progressEta     = document.getElementById('progressEta');
+const queuePanel      = document.getElementById('queuePanel');
+const queuePanelBody  = document.getElementById('queuePanelBody');
+const progressLabel   = document.getElementById('progressLabel');
+const filterChipsEl   = document.getElementById('filterChips');
+const chipsContainer  = document.getElementById('chipsContainer');
+const clearAllFilters = document.getElementById('clearAllFilters');
+const entryRows       = document.getElementById('entryRows');
+const reviewPane      = document.getElementById('reviewPane');
+const paneBackdrop    = document.getElementById('paneBackdrop');
+const closePaneBtn    = document.getElementById('closePaneBtn');
+const selectAll       = document.getElementById('selectAll');
+const dropdown        = document.getElementById('columnFilterDropdown');
+const sortAscBtn      = document.getElementById('sortAscBtn');
+const sortDescBtn     = document.getElementById('sortDescBtn');
+const dropdownFilter  = document.getElementById('dropdownFilterSection');
+const clearColFilter  = document.getElementById('clearColFilterBtn');
+
+let dropdownCol = null;  // which column the dropdown is open for
+
+// ── Help modal ────────────────────────────────────────────────────────────────
+const helpBackdrop = document.getElementById('helpBackdrop');
+const helpModal    = document.getElementById('helpModal');
+document.getElementById('helpBtn').addEventListener('click', () => {
+  helpBackdrop.style.display = '';
+  helpModal.style.display = '';
+});
+document.getElementById('closeHelpBtn').addEventListener('click', closeHelp);
+helpBackdrop.addEventListener('click', closeHelp);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && helpModal.style.display !== 'none') closeHelp();
+});
+function closeHelp() {
+  helpBackdrop.style.display = 'none';
+  helpModal.style.display = 'none';
+}
+
+// ── Utility ───────────────────────────────────────────────────────────────────
+function statusDot(entry) {
+  if (entry.fallback_used) return '<span class="status-dot status-fallback" title="Ollama failed; heuristic used"></span>';
+  const cls = { none: 'status-none', pending: 'status-pending', ready: 'status-ready', done: 'status-done' };
+  const t   = { none: 'No suggestion', pending: 'Queued / processing', ready: 'Suggestion ready', done: 'Reviewed' };
+  const s = entry.suggestion_status || 'none';
+  return `<span class="status-dot ${cls[s] || 'status-none'}" title="${t[s] || s}"></span>`;
+}
+
+function qualityDisplay(entry) {
+  return entry.llm_quality != null ? entry.llm_quality : (entry.heuristic_quality ?? '—');
+}
+
+function tagsHtml(tags) {
+  if (!tags || !tags.length) return '<span style="color:var(--text-muted)">—</span>';
+  return tags.map(t => `<span class="tag-badge">${esc(t)}</span>`).join('');
+}
+
+function getFieldState(docId, field) {
+  return (fieldStates.get(docId) || {})[field] || 'undecided';
+}
+
+function setFieldState(docId, field, state) {
+  if (!fieldStates.has(docId)) fieldStates.set(docId, {});
+  fieldStates.get(docId)[field] = state;
+  checkAllResolved(docId);
+}
+
+function checkAllResolved(docId) {
+  const sug = suggestions.get(docId);
+  if (!sug) return;
+  const states = fieldStates.get(docId) || {};
+  const fields = relevantFields(sug);
+  if (fields.every(f => states[f] && states[f] !== 'undecided')) {
+    // Update entry suggestion_status locally
+    const entry = currentEntries.find(e => e.id === docId);
+    if (entry) entry.suggestion_status = 'done';
+    // Re-render row
+    renderTable(filteredEntries);
+    updateToolbarCounts();
+    if (openPaneDocId === docId) refreshPane(docId);
+  }
+}
+
+function relevantFields(sug) {
+  const fields = ['title'];
+  if (sug.suggested_correspondent) fields.push('correspondent');
+  if (sug.suggested_document_type) fields.push('document_type');
+  if (sug.suggested_tags && sug.suggested_tags.length) fields.push('tags');
+  return fields;
+}
+
+function hasActionableUndecided(docId) {
+  const entry = currentEntries.find(e => e.id === docId);
+  const sug = suggestions.get(docId);
+  if (!entry || !sug) return false;
+  const states = fieldStates.get(docId) || {};
+  return relevantFields(sug).some(f => {
+    if ((states[f] || 'undecided') !== 'undecided') return false;
+    if (f === 'tags') {
+      const sugNames = new Set(sug.suggested_tags.map(t => t.name.toLowerCase()));
+      const protected_ = new Set((sug.protected_tags || []).map(t => t.toLowerCase()));
+      const currentLower = (entry.tags || []).map(x => x.toLowerCase());
+      return sug.suggested_tags.some(t => !currentLower.includes(t.name.toLowerCase()))
+          || (entry.tags || []).some(t => !sugNames.has(t.toLowerCase()) && !protected_.has(t.toLowerCase()));
+    }
+    return true;
   });
 }
 
-function renderSuggestions(items) {
-  suggestionsContainer.innerHTML = '';
-  items.forEach((item) => {
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.innerHTML = `
-      <label><input type="checkbox" data-approve="${esc(item.id)}" checked /> Approve</label>
-      <p><strong>Entry ID:</strong> ${esc(item.id)}</p>
-      <label>Title <input data-title="${esc(item.id)}" value="${esc(item.suggested_title)}" /></label>
-      <label>Tags (comma separated)
-        <input data-tags="${esc(item.id)}" value="${esc(item.suggested_tags.join(', '))}" />
-      </label>
-      <p><em>${esc(item.reason)}</em></p>
-    `;
-    suggestionsContainer.appendChild(card);
-  });
+function openNextDocToReview(direction = 1) {
+  if (!openPaneDocId) return;
+  const currentIdx = filteredEntries.findIndex(e => e.id === openPaneDocId);
+  if (currentIdx === -1) return;
+  const n = filteredEntries.length;
+  // Search forward (or backward) for a doc with actionable undecided suggestions
+  for (let i = 1; i < n; i++) {
+    const idx = (currentIdx + direction * i + n) % n;
+    const candidate = filteredEntries[idx];
+    if (hasActionableUndecided(candidate.id)) {
+      openReviewPane(candidate.id);
+      return;
+    }
+  }
+  // No actionable doc found — close the pane
+  closeReviewPane();
 }
 
+// ── Load entries ──────────────────────────────────────────────────────────────
 async function loadEntries() {
-  const response = await fetch(`/api/entries?sort_by=${sortBy.value}`);
-  if (!response.ok) {
-    rows.innerHTML = `<tr><td colspan="4">Failed to load entries: ${esc(await response.text())}</td></tr>`;
-    return;
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  refreshBtn.textContent = 'Refreshing…';
+  refreshBtn.disabled = true;
+
+  try {
+    const response = await fetch('/api/entries?sort_by=quality');
+    if (!response.ok) {
+      entryRows.innerHTML = `<tr><td colspan="20" style="color:#f87171">Failed to load: ${esc(await response.text())}</td></tr>`;
+      return;
+    }
+    currentEntries = await response.json();
+    // Merge local suggestion_status from our in-flight state
+    for (const entry of currentEntries) {
+      const sug = suggestions.get(entry.id);
+      if (sug) {
+        if (entry.suggestion_status === 'none' || entry.suggestion_status === 'pending') {
+          entry.suggestion_status = 'ready';
+        }
+      }
+    }
+    applyFilterSort();
+    updateToolbarCounts();
+  } finally {
+    refreshBtn.textContent = 'Refresh';
+    refreshBtn.disabled = false;
+    refreshInFlight = false;
   }
-  currentEntries = await response.json();
-  renderEntries(currentEntries);
 }
 
-async function generateSuggestions() {
-  const selected = [...document.querySelectorAll('input[data-id]:checked')].map((box) => Number(box.dataset.id));
-  if (!selected.length) {
-    alert('Select at least one entry first.');
-    return;
+// ── Filter + sort ─────────────────────────────────────────────────────────────
+function applyFilterSort() {
+  let data = [...currentEntries];
+
+  for (const [col, filter] of Object.entries(activeFilters)) {
+    if (!filter || (typeof filter === 'object' && !filter.values && !filter.value && filter.min == null && filter.max == null && !filter.from && !filter.to && !filter.neverReviewed)) continue;
+    data = data.filter(e => matchFilter(e, col, filter));
   }
-  const response = await fetch('/api/suggestions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids: selected }),
+
+  data = sortData(data, activeSortCol, activeSortDir);
+  filteredEntries = data;
+  renderTable(data);
+  renderFilterChips();
+}
+
+function matchFilter(entry, col, filter) {
+  if (typeof filter === 'string') {
+    // text search
+    const val = String(entry[col] || '').toLowerCase();
+    return val.includes(filter.toLowerCase());
+  }
+  if (filter.values) {
+    // checkbox set
+    if (col === 'tags') return (entry.tags || []).some(t => filter.values.has(t));
+    const dataKey = col === 'status' ? 'suggestion_status' : col;
+    return filter.values.has(String(entry[dataKey] || '—'));
+  }
+  if (filter.min != null || filter.max != null) {
+    const v = entry.llm_quality != null ? entry.llm_quality : (entry.heuristic_quality || 0);
+    if (filter.min != null && v < filter.min) return false;
+    if (filter.max != null && v > filter.max) return false;
+    return true;
+  }
+  if (filter.from || filter.to) {
+    const v = entry[col] || '';
+    if (filter.from && v < filter.from) return false;
+    if (filter.to && v > filter.to) return false;
+    return true;
+  }
+  if (filter.neverReviewed) {
+    return !entry.metadata_reviewed;
+  }
+  return true;
+}
+
+function sortData(data, col, dir) {
+  return [...data].sort((a, b) => {
+    let av = a[col], bv = b[col];
+    if (col === 'quality') {
+      av = a.llm_quality != null ? a.llm_quality : (a.heuristic_quality || 0);
+      bv = b.llm_quality != null ? b.llm_quality : (b.heuristic_quality || 0);
+    }
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    const cmp = typeof av === 'string' ? av.localeCompare(bv) : av - bv;
+    return dir === 'asc' ? cmp : -cmp;
   });
-  if (!response.ok) {
-    alert(`Failed to generate suggestions: ${await response.text()}`);
-    return;
-  }
-  currentSuggestions = await response.json();
-  renderSuggestions(currentSuggestions);
 }
 
-async function applySuggestions() {
-  const approved = currentSuggestions
-    .filter((item) => document.querySelector(`input[data-approve="${item.id}"]`)?.checked)
-    .map((item) => {
-      const title = document.querySelector(`input[data-title="${item.id}"]`).value;
-      const tags = document.querySelector(`input[data-tags="${item.id}"]`).value
-        .split(',')
-        .map((t) => t.trim())
-        .filter(Boolean);
-      return { id: item.id, title, tags };
+// ── Render table ──────────────────────────────────────────────────────────────
+function renderTable(data) {
+  const fragment = document.createDocumentFragment();
+
+  for (const entry of data) {
+    const tr = document.createElement('tr');
+    if (openPaneDocId === entry.id) tr.classList.add('row-selected');
+
+    const sug = suggestions.get(entry.id);
+    const states = fieldStates.get(entry.id) || {};
+
+    let cells = `
+      <td class="col-check"><input type="checkbox" class="row-check" data-id="${entry.id}" ${approvedDocs.has(entry.id) ? 'checked' : ''} /></td>
+      <td>${statusDot(entry)}</td>
+      <td title="${esc(entry.title)}">${esc(entry.title)}</td>
+      <td>${esc(entry.correspondent || '—')}</td>
+      <td>${esc(entry.document_type || '—')}</td>
+      <td>${esc(entry.date ? entry.date.slice(0, 10) : '—')}</td>
+      <td>${tagsHtml(entry.tags)}</td>
+      <td>${esc(qualityDisplay(entry))}</td>
+      <td>${esc(entry.metadata_completeness)}</td>
+      <td>${esc(entry.metadata_reviewed || '—')}</td>
+    `;
+
+    if (suggestionsVisible && sug) {
+      cells += sugColumnCell(entry.id, 'title', sug.suggested_title, states);
+      cells += sugColumnCell(entry.id, 'correspondent', sug.suggested_correspondent?.name, states);
+      cells += sugColumnCell(entry.id, 'document_type', sug.suggested_document_type?.name, states);
+      // Tags column
+      const tagState = states['tags'] || 'undecided';
+      if (tagState === 'applied') {
+        cells += `<td><span class="sug-applied">${esc(sug.suggested_tags.map(t=>t.name).join(', '))}</span></td>`;
+      } else if (tagState === 'rejected') {
+        cells += `<td><span class="sug-rejected">${esc(sug.suggested_tags.map(t=>t.name).join(', '))}</span></td>`;
+      } else {
+        cells += `<td><div class="sug-cell">
+          <span class="sug-value">${esc(sug.suggested_tags.map(t=>t.name).join(', '))}</span>
+          <button class="apply-btn" data-action="apply" data-id="${entry.id}" data-field="tags">✓</button>
+          <button class="reject-btn" data-action="reject" data-id="${entry.id}" data-field="tags">✕</button>
+        </div></td>`;
+      }
+    } else if (suggestionsVisible) {
+      cells += '<td></td><td></td><td></td><td></td>';
+    }
+
+    tr.innerHTML = cells;
+    tr.querySelector('.row-check')?.addEventListener('change', onRowCheckChange);
+    tr.addEventListener('click', e => {
+      if (e.target.type === 'checkbox' || e.target.tagName === 'BUTTON') return;
+      openReviewPane(entry.id);
+    });
+    fragment.appendChild(tr);
+  }
+
+  entryRows.innerHTML = '';
+  entryRows.appendChild(fragment);
+
+  // Wire inline apply/reject buttons
+  entryRows.querySelectorAll('[data-action]').forEach(btn => {
+    btn.addEventListener('click', onInlineAction);
+  });
+
+  updateSuggestionColumns();
+}
+
+function sugColumnCell(docId, field, value, states) {
+  const state = states[field] || 'undecided';
+  if (!value) return '<td>—</td>';
+  if (state === 'applied') return `<td><span class="sug-applied">${esc(value)}</span></td>`;
+  if (state === 'rejected') return `<td><span class="sug-rejected">${esc(value)}</span></td>`;
+  return `<td><div class="sug-cell">
+    <span class="sug-value">${esc(value)}</span>
+    <button class="apply-btn" data-action="apply" data-id="${docId}" data-field="${field}">✓</button>
+    <button class="reject-btn" data-action="reject" data-id="${docId}" data-field="${field}">✕</button>
+  </div></td>`;
+}
+
+function updateSuggestionColumns() {
+  const headerRow = document.getElementById('tableHeaderRow');
+  // Remove existing suggestion headers
+  headerRow.querySelectorAll('.sug-header').forEach(th => th.remove());
+  if (!suggestionsVisible) return;
+  ['Suggested title', 'Sugg. correspondent', 'Sugg. doc. type', 'Suggested tags'].forEach(label => {
+    const th = document.createElement('th');
+    th.className = 'sug-header';
+    th.textContent = label;
+    headerRow.appendChild(th);
+  });
+}
+
+// ── Row checkbox ──────────────────────────────────────────────────────────────
+function onRowCheckChange(e) {
+  const id = Number(e.target.dataset.id);
+  if (e.target.checked) approvedDocs.add(id); else approvedDocs.delete(id);
+  updateToolbarCounts();
+}
+
+selectAll.addEventListener('change', () => {
+  const checked = selectAll.checked;
+  entryRows.querySelectorAll('.row-check').forEach(cb => {
+    const id = Number(cb.dataset.id);
+    cb.checked = checked;
+    if (checked) approvedDocs.add(id); else approvedDocs.delete(id);
+  });
+  updateToolbarCounts();
+});
+
+// ── Toolbar counts ────────────────────────────────────────────────────────────
+function updateToolbarCounts() {
+  const readyCount = currentEntries.filter(e => e.suggestion_status === 'ready').length;
+  readyCountEl.textContent = readyCount;
+  showSuggestBtn.style.display = readyCount > 0 || suggestionsVisible ? '' : 'none';
+
+  const approvedWithSug = [...approvedDocs].filter(id => suggestions.has(id)).length;
+  approvedCountEl.textContent = approvedWithSug;
+  applyAllBtn.disabled = approvedWithSug === 0 || applyInFlight;
+}
+
+// ── Generate suggestions ──────────────────────────────────────────────────────
+async function generateSuggestions() {
+  const selected = [...approvedDocs];
+  if (!selected.length) {
+    // fall back to all visible
+    const visible = filteredEntries.map(e => e.id);
+    if (!visible.length) { alert('No documents selected.'); return; }
+    visible.forEach(id => approvedDocs.add(id));
+  }
+
+  const ids = [...approvedDocs];
+  suggestBtn.textContent = 'Queuing…';
+
+  try {
+    const resp = await fetch('/api/suggestions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids }),
+    });
+    if (!resp.ok) { alert(`Failed: ${await resp.text()}`); return; }
+    const { total } = await resp.json();
+    startPolling(total);
+    cancelQueueBtn.style.display = '';
+    // Mark entries as pending locally
+    for (const id of ids) {
+      const entry = currentEntries.find(e => e.id === id);
+      if (entry) entry.suggestion_status = 'pending';
+    }
+    renderTable(filteredEntries);
+  } finally {
+    suggestBtn.textContent = 'Generate suggestions';
+  }
+}
+
+function startPolling(total) {
+  setProgress(0, total);
+  progressSection.style.display = '';
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => pollStatus(), 2000);
+}
+
+async function pollStatus() {
+  try {
+    const resp = await fetch('/api/suggestions/status');
+    if (!resp.ok) { stopPolling(); return; }
+    const data = await resp.json();
+    lastQueueData = data;
+    setProgress(data.completed, data.total, data.eta_seconds, data.avg_seconds_per_doc);
+    if (queuePanel.style.display !== 'none') renderQueuePanel();
+
+    // Integrate new results
+    for (const sug of data.results) {
+      if (!suggestions.has(sug.id)) {
+        suggestions.set(sug.id, sug);
+        if (!fieldStates.has(sug.id)) fieldStates.set(sug.id, {});
+        const entry = currentEntries.find(e => e.id === sug.id);
+        if (entry) {
+          entry.suggestion_status = sug.fallback_used ? 'ready' : 'ready';
+          entry.fallback_used = sug.fallback_used;
+          if (sug.title_quality != null) entry.llm_quality = sug.title_quality;
+        }
+      }
+    }
+
+    renderTable(filteredEntries);
+    updateToolbarCounts();
+
+    if (data.completed >= data.total) {
+      stopPolling();
+    }
+  } catch (_) {}
+}
+
+function setProgress(done, total, etaSeconds, avgSeconds) {
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  progressFill.style.width = pct + '%';
+  progressLabel.textContent = `Processing ${done} of ${total}…`;
+  if (etaSeconds != null) {
+    const mins = Math.floor(etaSeconds / 60);
+    const secs = Math.round(etaSeconds % 60);
+    const etaStr = mins > 0 ? `${mins}m ${secs}s remaining` : `${secs}s remaining`;
+    const speedStr = avgSeconds != null ? ` · ${avgSeconds}s/doc` : '';
+    progressEta.textContent = etaStr + speedStr;
+  } else {
+    progressEta.textContent = '';
+  }
+}
+
+function renderQueuePanel() {
+  if (!lastQueueData) return;
+  const { items, elapsed_seconds, avg_seconds_per_doc, eta_seconds, completed, total } = lastQueueData;
+  queuePanelBody.innerHTML = '';
+
+  // Stats row
+  const stats = document.createElement('div');
+  stats.className = 'queue-stats';
+  const elapsedStr = elapsed_seconds != null ? `Elapsed: ${elapsed_seconds}s` : '';
+  const speedStr = avg_seconds_per_doc != null ? `Speed: ${avg_seconds_per_doc}s/doc` : '';
+  const etaStr = eta_seconds != null ? `ETA: ${eta_seconds >= 60 ? Math.floor(eta_seconds/60)+'m ' : ''}${Math.round(eta_seconds%60)}s` : '';
+  [elapsedStr, speedStr, etaStr].filter(Boolean).forEach(s => {
+    const span = document.createElement('span'); span.textContent = s; stats.appendChild(span);
+  });
+  queuePanelBody.appendChild(stats);
+
+  // Item list
+  const statusIcon = { pending: '⏳', processing: '⚙️', done: '✓', failed: '⚠️' };
+  for (const item of (items || [])) {
+    const row = document.createElement('div');
+    row.className = 'queue-item';
+    const icon = document.createElement('span');
+    icon.className = 'queue-item-icon';
+    icon.textContent = statusIcon[item.status] || '·';
+    const title = document.createElement('span');
+    title.className = 'queue-item-title';
+    title.textContent = item.title;
+    const dur = document.createElement('span');
+    dur.className = 'queue-item-duration';
+    if (item.started_at && item.finished_at) {
+      dur.textContent = `${Math.round(item.finished_at - item.started_at)}s`;
+    } else if (item.status === 'processing' && item.started_at) {
+      dur.textContent = 'running…';
+    }
+    row.appendChild(icon); row.appendChild(title); row.appendChild(dur);
+    queuePanelBody.appendChild(row);
+  }
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  progressSection.style.display = 'none';
+  cancelQueueBtn.style.display = 'none';
+  // Keep queue panel open so user can review results; they can close it manually
+}
+
+progressTrack.addEventListener('click', () => {
+  if (queuePanel.style.display === 'none') {
+    renderQueuePanel();
+    queuePanel.style.display = '';
+  } else {
+    queuePanel.style.display = 'none';
+  }
+});
+
+document.getElementById('closeQueuePanel').addEventListener('click', () => {
+  queuePanel.style.display = 'none';
+});
+
+cancelQueueBtn.addEventListener('click', async () => {
+  stopPolling();
+  await fetch('/api/suggestions/queue', { method: 'DELETE' });
+});
+
+// ── Show suggestions toggle ───────────────────────────────────────────────────
+showSuggestBtn.addEventListener('click', () => {
+  suggestionsVisible = !suggestionsVisible;
+  showSuggestBtn.textContent = (suggestionsVisible ? 'Hide suggestions (' : 'Show suggestions (') + readyCountEl.textContent + ' ready)';
+  renderTable(filteredEntries);
+});
+
+// ── Inline apply / reject ─────────────────────────────────────────────────────
+async function onInlineAction(e) {
+  const btn = e.currentTarget;
+  const action = btn.dataset.action;
+  const docId = Number(btn.dataset.id);
+  const field = btn.dataset.field;
+
+  if (action === 'reject') {
+    setFieldState(docId, field, 'rejected');
+    renderTable(filteredEntries);
+    if (openPaneDocId === docId) refreshPane(docId);
+    return;
+  }
+
+  // Apply
+  const sug = suggestions.get(docId);
+  if (!sug) return;
+  await applyField(docId, field, sug);
+}
+
+async function applyField(docId, field, sug) {
+  const item = { id: docId, tags_new: [] };
+
+  if (field === 'title') item.title = sug.suggested_title;
+  else if (field === 'correspondent') item.correspondent = sug.suggested_correspondent?.name || null;
+  else if (field === 'document_type') item.document_type = sug.suggested_document_type?.name || null;
+  else if (field === 'tags') {
+    item.tags = sug.suggested_tags.filter(t => !t.is_new).map(t => t.name);
+    item.tags_new = sug.suggested_tags.filter(t => t.is_new).map(t => t.name);
+  }
+
+  try {
+    const resp = await fetch('/api/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entries: [item] }),
+    });
+    if (!resp.ok) { alert(`Apply failed: ${await resp.text()}`); return; }
+    setFieldState(docId, field, 'applied');
+  } catch (err) {
+    alert(`Apply error: ${err.message}`);
+    return;
+  }
+
+  renderTable(filteredEntries);
+  if (openPaneDocId === docId) refreshPane(docId);
+}
+
+// ── Apply all approved ────────────────────────────────────────────────────────
+applyAllBtn.addEventListener('click', async () => {
+  if (applyInFlight) return;
+  applyInFlight = true;
+  applyAllBtn.disabled = true;
+  applyAllBtn.textContent = 'Applying…';
+
+  const entries = [];
+  for (const docId of approvedDocs) {
+    const sug = suggestions.get(docId);
+    if (!sug) continue;
+    const states = fieldStates.get(docId) || {};
+    const item = { id: docId, tags_new: [] };
+
+    if ((states['title'] || 'undecided') === 'undecided') item.title = sug.suggested_title;
+    if (sug.suggested_correspondent && (states['correspondent'] || 'undecided') === 'undecided')
+      item.correspondent = sug.suggested_correspondent.name;
+    if (sug.suggested_document_type && (states['document_type'] || 'undecided') === 'undecided')
+      item.document_type = sug.suggested_document_type.name;
+    if (sug.suggested_tags.length && (states['tags'] || 'undecided') === 'undecided') {
+      item.tags = sug.suggested_tags.filter(t => !t.is_new).map(t => t.name);
+      item.tags_new = sug.suggested_tags.filter(t => t.is_new).map(t => t.name);
+    }
+    entries.push(item);
+  }
+
+  if (!entries.length) { applyInFlight = false; applyAllBtn.disabled = false; applyAllBtn.textContent = `Apply all approved (${approvedCountEl.textContent})`; return; }
+
+  try {
+    const resp = await fetch('/api/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entries }),
+    });
+    if (!resp.ok) { alert(`Apply failed: ${await resp.text()}`); return; }
+
+    // Mark all fields applied
+    for (const item of entries) {
+      const sug = suggestions.get(item.id);
+      if (!sug) continue;
+      for (const f of relevantFields(sug)) setFieldState(item.id, f, 'applied');
+    }
+    approvedDocs.clear();
+    await loadEntries();
+  } finally {
+    applyInFlight = false;
+    applyAllBtn.textContent = `Apply all approved (0)`;
+    applyAllBtn.disabled = true;
+  }
+});
+
+// ── Review pane ───────────────────────────────────────────────────────────────
+function openReviewPane(docId) {
+  openPaneDocId = docId;
+  reviewPane.style.display = '';
+  paneBackdrop.style.display = '';
+  document.body.classList.add('pane-open');
+  refreshPane(docId);
+
+  // Highlight row
+  entryRows.querySelectorAll('tr').forEach(tr => {
+    const cb = tr.querySelector('.row-check');
+    if (cb && Number(cb.dataset.id) === docId) tr.classList.add('row-selected');
+    else tr.classList.remove('row-selected');
+  });
+}
+
+function refreshPane(docId) {
+  const entry = currentEntries.find(e => e.id === docId);
+  if (!entry) return;
+
+  document.getElementById('paneTitle').textContent = entry.title;
+  const thumb = document.getElementById('paneThumb');
+  thumb.src = `/api/documents/${docId}/thumb`;
+  document.getElementById('panePreviewLink').href = `/api/documents/${docId}/preview`;
+  const paperlessLink = document.getElementById('panePaperlessLink');
+  if (paperlessBaseUrl) {
+    paperlessLink.href = `${paperlessBaseUrl}/documents/${docId}/details`;
+    paperlessLink.style.display = '';
+  } else {
+    paperlessLink.style.display = 'none';
+  }
+
+  const sug = suggestions.get(docId);
+  const states = fieldStates.get(docId) || {};
+
+  const paneFields = document.getElementById('paneFields');
+  paneFields.innerHTML = '';
+
+  // Language
+  if (sug?.detected_language) {
+    const langEl = document.createElement('div');
+    langEl.className = 'lang-label';
+    langEl.textContent = `🌐 ${sug.detected_language}`;
+    paneFields.appendChild(langEl);
+  }
+
+  // Fields
+  const fieldDefs = [
+    { key: 'title', label: 'Title', current: entry.title, sugValue: sug?.suggested_title },
+    { key: 'correspondent', label: 'Correspondent', current: entry.correspondent || '—', sugValue: sug?.suggested_correspondent?.name },
+    { key: 'document_type', label: 'Document type', current: entry.document_type || '—', sugValue: sug?.suggested_document_type?.name },
+  ];
+
+  for (const def of fieldDefs) {
+    const div = buildPaneField(docId, def.key, def.label, def.current, def.sugValue, states[def.key] || 'undecided', sug);
+    paneFields.appendChild(div);
+  }
+
+  // Tags field
+  const tagsDiv = buildPaneTagsField(docId, entry.tags, sug, states['tags'] || 'undecided');
+  paneFields.appendChild(tagsDiv);
+
+  // Reason
+  if (sug?.reason) {
+    const reasonEl = document.createElement('div');
+    reasonEl.style.cssText = 'font-size:0.82rem;color:var(--text-muted);font-style:italic;';
+    reasonEl.textContent = sug.reason;
+    paneFields.appendChild(reasonEl);
+  }
+
+  // Apply all / Reject all
+  const hasUndecided = hasActionableUndecided(docId);
+  document.getElementById('paneApplyAllBtn').style.display = hasUndecided ? '' : 'none';
+  document.getElementById('paneRejectAllBtn').style.display = hasUndecided ? '' : 'none';
+
+  // Prev / Next nav buttons — show whether adjacent actionable docs exist
+  const currentIdx = filteredEntries.findIndex(e => e.id === docId);
+  const n = filteredEntries.length;
+  const hasPrev = n > 1 && filteredEntries.some((e, i) => i !== currentIdx && hasActionableUndecided(e.id));
+  const hasNext = hasPrev; // symmetric — if any other doc is actionable, both arrows are useful
+  document.getElementById('panePrevBtn').style.opacity = hasPrev ? '1' : '0.3';
+  document.getElementById('paneNextBtn').style.opacity = hasNext ? '1' : '0.3';
+
+  // Reasoning
+  if (sug?.reasoning) {
+    document.getElementById('paneReasoning').style.display = '';
+    document.getElementById('paneReasoningText').textContent = sug.reasoning;
+  } else {
+    document.getElementById('paneReasoning').style.display = 'none';
+  }
+}
+
+function buildPaneField(docId, field, label, current, sugValue, state, sug) {
+  const div = document.createElement('div');
+  div.className = 'pane-field';
+
+  const lbl = document.createElement('div');
+  lbl.className = 'pane-field-label';
+  lbl.textContent = label;
+  div.appendChild(lbl);
+
+  const cur = document.createElement('div');
+  cur.className = 'pane-field-current';
+  cur.textContent = current;
+  div.appendChild(cur);
+
+  if (!sugValue || !sug) return div;
+
+  if (state === 'applied') {
+    const a = document.createElement('div');
+    a.className = 'pane-field-applied';
+    div.appendChild(a);
+  } else if (state === 'rejected') {
+    const r = document.createElement('div');
+    r.className = 'pane-field-rejected';
+    r.textContent = sugValue;
+    div.appendChild(r);
+  } else {
+    const sugRow = document.createElement('div');
+    sugRow.className = 'pane-field-suggestion';
+    sugRow.innerHTML = `<span>${esc(sugValue)}</span>`;
+
+    const conf = field === 'correspondent' ? sug.suggested_correspondent?.confidence
+                 : field === 'document_type' ? sug.suggested_document_type?.confidence
+                 : null;
+    if (conf != null) {
+      const pill = document.createElement('span');
+      pill.className = 'confidence-pill';
+      pill.textContent = Math.round(conf * 100) + '%';
+      sugRow.appendChild(pill);
+    }
+
+    const applyBtn = document.createElement('button');
+    applyBtn.className = 'apply-btn';
+    applyBtn.textContent = 'Apply';
+    applyBtn.addEventListener('click', () => applyField(docId, field, sug));
+
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'reject-btn';
+    rejectBtn.textContent = 'Reject';
+    rejectBtn.addEventListener('click', () => {
+      setFieldState(docId, field, 'rejected');
+      renderTable(filteredEntries);
+      refreshPane(docId);
     });
 
-  if (!approved.length) {
-    alert('Nothing approved.');
-    return;
+    sugRow.appendChild(applyBtn);
+    sugRow.appendChild(rejectBtn);
+    div.appendChild(sugRow);
   }
-
-  const response = await fetch('/api/apply', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ entries: approved }),
-  });
-
-  if (!response.ok) {
-    const problem = await response.text();
-    alert(`Apply failed: ${problem}`);
-    return;
-  }
-
-  alert('Changes applied to Paperless.');
-  await loadEntries();
+  return div;
 }
 
-refreshBtn.addEventListener('click', loadEntries);
-sortBy.addEventListener('change', loadEntries);
-suggestBtn.addEventListener('click', generateSuggestions);
-applyBtn.addEventListener('click', applySuggestions);
+function buildPaneTagsField(docId, currentTags, sug, state) {
+  const div = document.createElement('div');
+  div.className = 'pane-field';
 
+  const lbl = document.createElement('div');
+  lbl.className = 'pane-field-label';
+  lbl.textContent = 'Tags';
+  div.appendChild(lbl);
+
+  const cur = document.createElement('div');
+  cur.className = 'pane-field-current';
+  cur.innerHTML = tagsHtml(currentTags);
+  div.appendChild(cur);
+
+  if (!sug || !sug.suggested_tags.length) return div;
+
+  // Compute diff: what changes relative to current tags
+  const suggestedNames = new Set(sug.suggested_tags.map(t => t.name.toLowerCase()));
+  const protectedNames = new Set((sug.protected_tags || []).map(t => t.toLowerCase()));
+  const currentLower = currentTags.map(x => x.toLowerCase());
+  // Tags present in suggestion but not current = additions
+  const additions = sug.suggested_tags.filter(t => !currentLower.includes(t.name.toLowerCase()));
+  // Current non-protected tags not in suggestion = removals
+  const removals = currentTags.filter(t => !suggestedNames.has(t.toLowerCase()) && !protectedNames.has(t.toLowerCase()));
+
+  const hasDiff = additions.length > 0 || removals.length > 0;
+  if (!hasDiff) return div;
+
+  if (state === 'applied') {
+    const a = document.createElement('div');
+    a.className = 'pane-field-applied';
+    div.appendChild(a);
+  } else if (state === 'rejected') {
+    const r = document.createElement('div');
+    r.className = 'pane-field-rejected';
+    r.textContent = 'Changes rejected';
+    div.appendChild(r);
+  } else {
+    const diffRow = document.createElement('div');
+    diffRow.className = 'pane-field-suggestion tag-diff';
+
+    additions.forEach(t => {
+      const badge = document.createElement('span');
+      badge.className = `tag-badge tag-add${t.is_new ? ' is-new' : ''}`;
+      badge.title = `Add — confidence ${Math.round(t.confidence * 100)}%`;
+      badge.textContent = '+ ' + t.name;
+      diffRow.appendChild(badge);
+    });
+    removals.forEach(name => {
+      const badge = document.createElement('span');
+      badge.className = 'tag-badge tag-remove';
+      badge.title = 'Remove';
+      badge.textContent = '− ' + name;
+      diffRow.appendChild(badge);
+    });
+
+    const applyBtn = document.createElement('button');
+    applyBtn.className = 'apply-btn';
+    applyBtn.textContent = 'Apply';
+    applyBtn.addEventListener('click', () => applyField(docId, 'tags', sug));
+
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'reject-btn';
+    rejectBtn.textContent = 'Reject';
+    rejectBtn.addEventListener('click', () => {
+      setFieldState(docId, 'tags', 'rejected');
+      renderTable(filteredEntries);
+      refreshPane(docId);
+    });
+
+    diffRow.appendChild(applyBtn);
+    diffRow.appendChild(rejectBtn);
+    div.appendChild(diffRow);
+  }
+  return div;
+}
+
+document.getElementById('paneApplyAllBtn').addEventListener('click', async () => {
+  if (!openPaneDocId) return;
+  const sug = suggestions.get(openPaneDocId);
+  if (!sug) return;
+  const states = fieldStates.get(openPaneDocId) || {};
+  for (const f of relevantFields(sug)) {
+    if ((states[f] || 'undecided') === 'undecided') await applyField(openPaneDocId, f, sug);
+  }
+  openNextDocToReview(1);
+});
+
+document.getElementById('paneRejectAllBtn').addEventListener('click', () => {
+  if (!openPaneDocId) return;
+  const sug = suggestions.get(openPaneDocId);
+  if (!sug) return;
+  const states = fieldStates.get(openPaneDocId) || {};
+  for (const f of relevantFields(sug)) {
+    if ((states[f] || 'undecided') === 'undecided') setFieldState(openPaneDocId, f, 'rejected');
+  }
+  renderTable(filteredEntries);
+  openNextDocToReview(1);
+});
+
+document.getElementById('panePrevBtn').addEventListener('click', () => openNextDocToReview(-1));
+document.getElementById('paneNextBtn').addEventListener('click', () => openNextDocToReview(1));
+
+function closeReviewPane() {
+  reviewPane.style.display = 'none';
+  paneBackdrop.style.display = 'none';
+  document.body.classList.remove('pane-open');
+  openPaneDocId = null;
+  entryRows.querySelectorAll('tr').forEach(tr => tr.classList.remove('row-selected'));
+}
+closePaneBtn.addEventListener('click', closeReviewPane);
+paneBackdrop.addEventListener('click', closeReviewPane);
+
+// ── Pane keyboard shortcuts ───────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (!openPaneDocId) return;
+  // Don't fire when user is typing in an input/textarea
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
+  if (e.key === 'ArrowRight' || e.key === 'l') { e.preventDefault(); openNextDocToReview(1); }
+  else if (e.key === 'ArrowLeft' || e.key === 'h') { e.preventDefault(); openNextDocToReview(-1); }
+  else if (e.key === 'a') { e.preventDefault(); document.getElementById('paneApplyAllBtn').click(); }
+  else if (e.key === 'r') { e.preventDefault(); document.getElementById('paneRejectAllBtn').click(); }
+  else if (e.key === 'Escape') { e.preventDefault(); closeReviewPane(); }
+});
+
+// ── Column filter dropdown ────────────────────────────────────────────────────
+document.getElementById('tableHeaderRow').addEventListener('click', e => {
+  const th = e.target.closest('th[data-col]');
+  if (!th) { closeDropdown(); return; }
+  const col = th.dataset.col;
+  if (dropdownCol === col) { closeDropdown(); return; }
+  openDropdown(col, th);
+});
+
+function openDropdown(col, thEl) {
+  dropdownCol = col;
+  const rect = thEl.getBoundingClientRect();
+  dropdown.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+  dropdown.style.left = Math.min(rect.left + window.scrollX, window.innerWidth - 280) + 'px';
+  dropdown.style.display = '';
+
+  buildDropdownFilter(col);
+}
+
+function closeDropdown() {
+  dropdown.style.display = 'none';
+  dropdownCol = null;
+}
+
+sortAscBtn.addEventListener('click', () => {
+  if (!dropdownCol) return;
+  activeSortCol = dropdownCol === 'quality' ? 'quality' : dropdownCol;
+  activeSortDir = 'asc';
+  applyFilterSort();
+  closeDropdown();
+});
+
+sortDescBtn.addEventListener('click', () => {
+  if (!dropdownCol) return;
+  activeSortCol = dropdownCol === 'quality' ? 'quality' : dropdownCol;
+  activeSortDir = 'desc';
+  applyFilterSort();
+  closeDropdown();
+});
+
+clearColFilter.addEventListener('click', () => {
+  if (!dropdownCol) return;
+  delete activeFilters[dropdownCol];
+  applyFilterSort();
+  closeDropdown();
+});
+
+document.addEventListener('click', e => {
+  if (!dropdown.contains(e.target) && !e.target.closest('th[data-col]')) closeDropdown();
+});
+
+function buildDropdownFilter(col) {
+  dropdownFilter.innerHTML = '';
+
+  if (col === 'title') {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'Search title…';
+    input.value = typeof activeFilters[col] === 'string' ? activeFilters[col] : '';
+    input.addEventListener('input', () => {
+      activeFilters[col] = input.value;
+      applyFilterSort();
+    });
+    dropdownFilter.appendChild(input);
+    return;
+  }
+
+  if (col === 'quality') {
+    const f = activeFilters[col] || {};
+    const minInput = document.createElement('input');
+    minInput.type = 'number'; minInput.placeholder = 'Min (0)'; minInput.value = f.min ?? '';
+    minInput.addEventListener('input', () => {
+      activeFilters[col] = { ...activeFilters[col], min: minInput.value ? Number(minInput.value) : null };
+      applyFilterSort();
+    });
+    const maxInput = document.createElement('input');
+    maxInput.type = 'number'; maxInput.placeholder = 'Max (100)'; maxInput.value = f.max ?? '';
+    maxInput.addEventListener('input', () => {
+      activeFilters[col] = { ...activeFilters[col], max: maxInput.value ? Number(maxInput.value) : null };
+      applyFilterSort();
+    });
+    const minLbl = document.createElement('label');
+    minLbl.textContent = 'Min quality'; minLbl.appendChild(minInput);
+    const maxLbl = document.createElement('label');
+    maxLbl.textContent = 'Max quality'; maxLbl.appendChild(maxInput);
+    dropdownFilter.appendChild(minLbl);
+    dropdownFilter.appendChild(maxLbl);
+    return;
+  }
+
+  if (col === 'date' || col === 'metadata_reviewed') {
+    const f = activeFilters[col] || {};
+    const fromInput = document.createElement('input');
+    fromInput.type = 'date'; fromInput.value = f.from || '';
+    fromInput.addEventListener('change', () => {
+      activeFilters[col] = { ...activeFilters[col], from: fromInput.value || null };
+      applyFilterSort();
+    });
+    const toInput = document.createElement('input');
+    toInput.type = 'date'; toInput.value = f.to || '';
+    toInput.addEventListener('change', () => {
+      activeFilters[col] = { ...activeFilters[col], to: toInput.value || null };
+      applyFilterSort();
+    });
+    const fromLbl = document.createElement('label'); fromLbl.textContent = 'From'; fromLbl.appendChild(fromInput);
+    const toLbl = document.createElement('label'); toLbl.textContent = 'To'; toLbl.appendChild(toInput);
+    dropdownFilter.appendChild(fromLbl);
+    dropdownFilter.appendChild(toLbl);
+
+    if (col === 'metadata_reviewed') {
+      const neverLbl = document.createElement('label');
+      const neverCb = document.createElement('input');
+      neverCb.type = 'checkbox';
+      neverCb.checked = !!(activeFilters[col] || {}).neverReviewed;
+      neverCb.addEventListener('change', () => {
+        activeFilters[col] = { ...activeFilters[col], neverReviewed: neverCb.checked };
+        applyFilterSort();
+      });
+      neverLbl.appendChild(neverCb);
+      neverLbl.appendChild(document.createTextNode(' Never reviewed'));
+      dropdownFilter.appendChild(neverLbl);
+    }
+    return;
+  }
+
+  // Checkbox list (correspondent, document_type, status, tags)
+  const existing = (activeFilters[col] || {}).values || new Set();
+  let values;
+  if (col === 'tags') {
+    values = [...new Set(currentEntries.flatMap(e => e.tags || []))].sort();
+  } else if (col === 'status') {
+    values = ['none', 'pending', 'ready', 'done'];
+  } else {
+    values = [...new Set(currentEntries.map(e => e[col] || '—'))].sort();
+  }
+
+  for (const val of values) {
+    const lbl = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = existing.has(val);
+    cb.addEventListener('change', () => {
+      const cur = (activeFilters[col] || {}).values || new Set();
+      const next = new Set(cur);
+      if (cb.checked) next.add(val); else next.delete(val);
+      if (next.size === 0) delete activeFilters[col];
+      else activeFilters[col] = { values: next };
+      applyFilterSort();
+    });
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(' ' + val));
+    dropdownFilter.appendChild(lbl);
+  }
+}
+
+// ── Filter chips ──────────────────────────────────────────────────────────────
+function renderFilterChips() {
+  const entries = Object.entries(activeFilters);
+  if (!entries.length) {
+    filterChipsEl.style.display = 'none';
+    return;
+  }
+  filterChipsEl.style.display = '';
+  chipsContainer.innerHTML = '';
+  for (const [col, filter] of entries) {
+    const chip = document.createElement('span');
+    chip.className = 'filter-chip';
+    chip.innerHTML = `<span>${esc(col)}: ${esc(filterDescription(filter))}</span>`;
+    const rm = document.createElement('button');
+    rm.textContent = '×';
+    rm.addEventListener('click', () => { delete activeFilters[col]; applyFilterSort(); });
+    chip.appendChild(rm);
+    chipsContainer.appendChild(chip);
+  }
+}
+
+function filterDescription(filter) {
+  if (typeof filter === 'string') return `"${filter}"`;
+  if (filter.values) return [...filter.values].join(', ');
+  if (filter.min != null || filter.max != null) return `${filter.min ?? ''}–${filter.max ?? ''}`;
+  if (filter.from || filter.to) return `${filter.from || ''}→${filter.to || ''}`;
+  if (filter.neverReviewed) return 'Never reviewed';
+  return '';
+}
+
+clearAllFilters.addEventListener('click', () => {
+  activeFilters = {};
+  applyFilterSort();
+});
+
+// ── Event wiring ──────────────────────────────────────────────────────────────
+refreshBtn.addEventListener('click', loadEntries);
+suggestBtn.addEventListener('click', generateSuggestions);
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+fetch('/api/settings').then(r => r.json()).then(s => { paperlessBaseUrl = (s.paperless_base_url || '').replace(/\/$/, ''); }).catch(() => {});
 loadEntries();
+// Reconnect to any in-progress queue (e.g. after page refresh)
+fetch('/api/suggestions/status').then(r => {
+  if (!r.ok) return;
+  return r.json();
+}).then(data => {
+  if (!data || data.completed >= data.total) return;
+  startPolling(data.total);
+  cancelQueueBtn.style.display = '';
+}).catch(() => {});

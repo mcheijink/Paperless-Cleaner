@@ -2,7 +2,8 @@ services:
   paperless-cleaner:
     build: .
     ports:
-      - "8080:8080"
+      - "8200:8080"
     volumes:
       - ./app/settings.json:/app/app/settings.json
     restart: unless-stopped
+    stop_grace_period: 70s
