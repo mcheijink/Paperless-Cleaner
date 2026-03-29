@@ -22,12 +22,13 @@ let activeSortDir = 'asc';
 let activeFilters = {};        // colName → filter value/state
 
 let suggestionsVisible = false;
-let currentJobId = null;
 let pollTimer = null;
 let openPaneDocId = null;
 
 let refreshInFlight = false;
 let applyInFlight = false;
+let paperlessBaseUrl = '';
+let lastQueueData = null;
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const refreshBtn      = document.getElementById('refreshBtn');
@@ -38,13 +39,18 @@ const cancelQueueBtn  = document.getElementById('cancelQueueBtn');
 const readyCountEl    = document.getElementById('readyCount');
 const approvedCountEl = document.getElementById('approvedCount');
 const progressSection = document.getElementById('progressSection');
+const progressTrack   = document.getElementById('progressTrack');
 const progressFill    = document.getElementById('progressFill');
+const progressEta     = document.getElementById('progressEta');
+const queuePanel      = document.getElementById('queuePanel');
+const queuePanelBody  = document.getElementById('queuePanelBody');
 const progressLabel   = document.getElementById('progressLabel');
 const filterChipsEl   = document.getElementById('filterChips');
 const chipsContainer  = document.getElementById('chipsContainer');
 const clearAllFilters = document.getElementById('clearAllFilters');
 const entryRows       = document.getElementById('entryRows');
 const reviewPane      = document.getElementById('reviewPane');
+const paneBackdrop    = document.getElementById('paneBackdrop');
 const closePaneBtn    = document.getElementById('closePaneBtn');
 const selectAll       = document.getElementById('selectAll');
 const dropdown        = document.getElementById('columnFilterDropdown');
@@ -54,6 +60,23 @@ const dropdownFilter  = document.getElementById('dropdownFilterSection');
 const clearColFilter  = document.getElementById('clearColFilterBtn');
 
 let dropdownCol = null;  // which column the dropdown is open for
+
+// ── Help modal ────────────────────────────────────────────────────────────────
+const helpBackdrop = document.getElementById('helpBackdrop');
+const helpModal    = document.getElementById('helpModal');
+document.getElementById('helpBtn').addEventListener('click', () => {
+  helpBackdrop.style.display = '';
+  helpModal.style.display = '';
+});
+document.getElementById('closeHelpBtn').addEventListener('click', closeHelp);
+helpBackdrop.addEventListener('click', closeHelp);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && helpModal.style.display !== 'none') closeHelp();
+});
+function closeHelp() {
+  helpBackdrop.style.display = 'none';
+  helpModal.style.display = 'none';
+}
 
 // ── Utility ───────────────────────────────────────────────────────────────────
 function statusDot(entry) {
@@ -107,6 +130,42 @@ function relevantFields(sug) {
   return fields;
 }
 
+function hasActionableUndecided(docId) {
+  const entry = currentEntries.find(e => e.id === docId);
+  const sug = suggestions.get(docId);
+  if (!entry || !sug) return false;
+  const states = fieldStates.get(docId) || {};
+  return relevantFields(sug).some(f => {
+    if ((states[f] || 'undecided') !== 'undecided') return false;
+    if (f === 'tags') {
+      const sugNames = new Set(sug.suggested_tags.map(t => t.name.toLowerCase()));
+      const protected_ = new Set((sug.protected_tags || []).map(t => t.toLowerCase()));
+      const currentLower = (entry.tags || []).map(x => x.toLowerCase());
+      return sug.suggested_tags.some(t => !currentLower.includes(t.name.toLowerCase()))
+          || (entry.tags || []).some(t => !sugNames.has(t.toLowerCase()) && !protected_.has(t.toLowerCase()));
+    }
+    return true;
+  });
+}
+
+function openNextDocToReview(direction = 1) {
+  if (!openPaneDocId) return;
+  const currentIdx = filteredEntries.findIndex(e => e.id === openPaneDocId);
+  if (currentIdx === -1) return;
+  const n = filteredEntries.length;
+  // Search forward (or backward) for a doc with actionable undecided suggestions
+  for (let i = 1; i < n; i++) {
+    const idx = (currentIdx + direction * i + n) % n;
+    const candidate = filteredEntries[idx];
+    if (hasActionableUndecided(candidate.id)) {
+      openReviewPane(candidate.id);
+      return;
+    }
+  }
+  // No actionable doc found — close the pane
+  closeReviewPane();
+}
+
 // ── Load entries ──────────────────────────────────────────────────────────────
 async function loadEntries() {
   if (refreshInFlight) return;
@@ -144,7 +203,7 @@ function applyFilterSort() {
   let data = [...currentEntries];
 
   for (const [col, filter] of Object.entries(activeFilters)) {
-    if (!filter || (typeof filter === 'object' && !filter.value && !filter.from && !filter.to && !filter.neverReviewed)) continue;
+    if (!filter || (typeof filter === 'object' && !filter.values && !filter.value && filter.min == null && filter.max == null && !filter.from && !filter.to && !filter.neverReviewed)) continue;
     data = data.filter(e => matchFilter(e, col, filter));
   }
 
@@ -163,7 +222,8 @@ function matchFilter(entry, col, filter) {
   if (filter.values) {
     // checkbox set
     if (col === 'tags') return (entry.tags || []).some(t => filter.values.has(t));
-    return filter.values.has(String(entry[col] || '—'));
+    const dataKey = col === 'status' ? 'suggestion_status' : col;
+    return filter.values.has(String(entry[dataKey] || '—'));
   }
   if (filter.min != null || filter.max != null) {
     const v = entry.llm_quality != null ? entry.llm_quality : (entry.heuristic_quality || 0);
@@ -327,7 +387,6 @@ async function generateSuggestions() {
   }
 
   const ids = [...approvedDocs];
-  suggestBtn.disabled = true;
   suggestBtn.textContent = 'Queuing…';
 
   try {
@@ -337,9 +396,8 @@ async function generateSuggestions() {
       body: JSON.stringify({ ids }),
     });
     if (!resp.ok) { alert(`Failed: ${await resp.text()}`); return; }
-    const { job_id, total } = await resp.json();
-    currentJobId = job_id;
-    startPolling(job_id, total);
+    const { total } = await resp.json();
+    startPolling(total);
     cancelQueueBtn.style.display = '';
     // Mark entries as pending locally
     for (const id of ids) {
@@ -352,19 +410,21 @@ async function generateSuggestions() {
   }
 }
 
-function startPolling(jobId, total) {
+function startPolling(total) {
   setProgress(0, total);
   progressSection.style.display = '';
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(() => pollStatus(jobId, total), 2000);
+  pollTimer = setInterval(() => pollStatus(), 2000);
 }
 
-async function pollStatus(jobId, total) {
+async function pollStatus() {
   try {
-    const resp = await fetch(`/api/suggestions/status?job_id=${encodeURIComponent(jobId)}`);
-    if (!resp.ok) return;
+    const resp = await fetch('/api/suggestions/status');
+    if (!resp.ok) { stopPolling(); return; }
     const data = await resp.json();
-    setProgress(data.completed, data.total);
+    lastQueueData = data;
+    setProgress(data.completed, data.total, data.eta_seconds, data.avg_seconds_per_doc);
+    if (queuePanel.style.display !== 'none') renderQueuePanel();
 
     // Integrate new results
     for (const sug of data.results) {
@@ -385,28 +445,87 @@ async function pollStatus(jobId, total) {
 
     if (data.completed >= data.total) {
       stopPolling();
-      suggestBtn.disabled = false;
     }
   } catch (_) {}
 }
 
-function setProgress(done, total) {
+function setProgress(done, total, etaSeconds, avgSeconds) {
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   progressFill.style.width = pct + '%';
   progressLabel.textContent = `Processing ${done} of ${total}…`;
+  if (etaSeconds != null) {
+    const mins = Math.floor(etaSeconds / 60);
+    const secs = Math.round(etaSeconds % 60);
+    const etaStr = mins > 0 ? `${mins}m ${secs}s remaining` : `${secs}s remaining`;
+    const speedStr = avgSeconds != null ? ` · ${avgSeconds}s/doc` : '';
+    progressEta.textContent = etaStr + speedStr;
+  } else {
+    progressEta.textContent = '';
+  }
+}
+
+function renderQueuePanel() {
+  if (!lastQueueData) return;
+  const { items, elapsed_seconds, avg_seconds_per_doc, eta_seconds, completed, total } = lastQueueData;
+  queuePanelBody.innerHTML = '';
+
+  // Stats row
+  const stats = document.createElement('div');
+  stats.className = 'queue-stats';
+  const elapsedStr = elapsed_seconds != null ? `Elapsed: ${elapsed_seconds}s` : '';
+  const speedStr = avg_seconds_per_doc != null ? `Speed: ${avg_seconds_per_doc}s/doc` : '';
+  const etaStr = eta_seconds != null ? `ETA: ${eta_seconds >= 60 ? Math.floor(eta_seconds/60)+'m ' : ''}${Math.round(eta_seconds%60)}s` : '';
+  [elapsedStr, speedStr, etaStr].filter(Boolean).forEach(s => {
+    const span = document.createElement('span'); span.textContent = s; stats.appendChild(span);
+  });
+  queuePanelBody.appendChild(stats);
+
+  // Item list
+  const statusIcon = { pending: '⏳', processing: '⚙️', done: '✓', failed: '⚠️' };
+  for (const item of (items || [])) {
+    const row = document.createElement('div');
+    row.className = 'queue-item';
+    const icon = document.createElement('span');
+    icon.className = 'queue-item-icon';
+    icon.textContent = statusIcon[item.status] || '·';
+    const title = document.createElement('span');
+    title.className = 'queue-item-title';
+    title.textContent = item.title;
+    const dur = document.createElement('span');
+    dur.className = 'queue-item-duration';
+    if (item.started_at && item.finished_at) {
+      dur.textContent = `${Math.round(item.finished_at - item.started_at)}s`;
+    } else if (item.status === 'processing' && item.started_at) {
+      dur.textContent = 'running…';
+    }
+    row.appendChild(icon); row.appendChild(title); row.appendChild(dur);
+    queuePanelBody.appendChild(row);
+  }
 }
 
 function stopPolling() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   progressSection.style.display = 'none';
   cancelQueueBtn.style.display = 'none';
-  suggestBtn.disabled = false;
+  // Keep queue panel open so user can review results; they can close it manually
 }
+
+progressTrack.addEventListener('click', () => {
+  if (queuePanel.style.display === 'none') {
+    renderQueuePanel();
+    queuePanel.style.display = '';
+  } else {
+    queuePanel.style.display = 'none';
+  }
+});
+
+document.getElementById('closeQueuePanel').addEventListener('click', () => {
+  queuePanel.style.display = 'none';
+});
 
 cancelQueueBtn.addEventListener('click', async () => {
   stopPolling();
   await fetch('/api/suggestions/queue', { method: 'DELETE' });
-  suggestBtn.disabled = false;
 });
 
 // ── Show suggestions toggle ───────────────────────────────────────────────────
@@ -519,7 +638,8 @@ applyAllBtn.addEventListener('click', async () => {
 function openReviewPane(docId) {
   openPaneDocId = docId;
   reviewPane.style.display = '';
-  document.getElementById('tableAndPane').classList.add('pane-open');
+  paneBackdrop.style.display = '';
+  document.body.classList.add('pane-open');
   refreshPane(docId);
 
   // Highlight row
@@ -538,6 +658,13 @@ function refreshPane(docId) {
   const thumb = document.getElementById('paneThumb');
   thumb.src = `/api/documents/${docId}/thumb`;
   document.getElementById('panePreviewLink').href = `/api/documents/${docId}/preview`;
+  const paperlessLink = document.getElementById('panePaperlessLink');
+  if (paperlessBaseUrl) {
+    paperlessLink.href = `${paperlessBaseUrl}/documents/${docId}/details`;
+    paperlessLink.style.display = '';
+  } else {
+    paperlessLink.style.display = 'none';
+  }
 
   const sug = suggestions.get(docId);
   const states = fieldStates.get(docId) || {};
@@ -578,9 +705,17 @@ function refreshPane(docId) {
   }
 
   // Apply all / Reject all
-  const hasUndecided = sug && relevantFields(sug).some(f => (states[f] || 'undecided') === 'undecided');
+  const hasUndecided = hasActionableUndecided(docId);
   document.getElementById('paneApplyAllBtn').style.display = hasUndecided ? '' : 'none';
   document.getElementById('paneRejectAllBtn').style.display = hasUndecided ? '' : 'none';
+
+  // Prev / Next nav buttons — show whether adjacent actionable docs exist
+  const currentIdx = filteredEntries.findIndex(e => e.id === docId);
+  const n = filteredEntries.length;
+  const hasPrev = n > 1 && filteredEntries.some((e, i) => i !== currentIdx && hasActionableUndecided(e.id));
+  const hasNext = hasPrev; // symmetric — if any other doc is actionable, both arrows are useful
+  document.getElementById('panePrevBtn').style.opacity = hasPrev ? '1' : '0.3';
+  document.getElementById('paneNextBtn').style.opacity = hasNext ? '1' : '0.3';
 
   // Reasoning
   if (sug?.reasoning) {
@@ -668,6 +803,18 @@ function buildPaneTagsField(docId, currentTags, sug, state) {
 
   if (!sug || !sug.suggested_tags.length) return div;
 
+  // Compute diff: what changes relative to current tags
+  const suggestedNames = new Set(sug.suggested_tags.map(t => t.name.toLowerCase()));
+  const protectedNames = new Set((sug.protected_tags || []).map(t => t.toLowerCase()));
+  const currentLower = currentTags.map(x => x.toLowerCase());
+  // Tags present in suggestion but not current = additions
+  const additions = sug.suggested_tags.filter(t => !currentLower.includes(t.name.toLowerCase()));
+  // Current non-protected tags not in suggestion = removals
+  const removals = currentTags.filter(t => !suggestedNames.has(t.toLowerCase()) && !protectedNames.has(t.toLowerCase()));
+
+  const hasDiff = additions.length > 0 || removals.length > 0;
+  if (!hasDiff) return div;
+
   if (state === 'applied') {
     const a = document.createElement('div');
     a.className = 'pane-field-applied';
@@ -675,15 +822,26 @@ function buildPaneTagsField(docId, currentTags, sug, state) {
   } else if (state === 'rejected') {
     const r = document.createElement('div');
     r.className = 'pane-field-rejected';
-    r.innerHTML = sug.suggested_tags.map(t => `<span class="tag-badge${t.is_new ? ' is-new' : ''}">${esc(t.name)}</span>`).join('');
+    r.textContent = 'Changes rejected';
     div.appendChild(r);
   } else {
-    const sugRow = document.createElement('div');
-    sugRow.className = 'pane-field-suggestion';
-    sugRow.style.flexWrap = 'wrap';
-    sugRow.innerHTML = sug.suggested_tags.map(t =>
-      `<span class="tag-badge${t.is_new ? ' is-new' : ''}" title="${t.is_new ? 'New tag' : 'Existing tag'} — confidence ${Math.round(t.confidence*100)}%">${esc(t.name)}</span>`
-    ).join('');
+    const diffRow = document.createElement('div');
+    diffRow.className = 'pane-field-suggestion tag-diff';
+
+    additions.forEach(t => {
+      const badge = document.createElement('span');
+      badge.className = `tag-badge tag-add${t.is_new ? ' is-new' : ''}`;
+      badge.title = `Add — confidence ${Math.round(t.confidence * 100)}%`;
+      badge.textContent = '+ ' + t.name;
+      diffRow.appendChild(badge);
+    });
+    removals.forEach(name => {
+      const badge = document.createElement('span');
+      badge.className = 'tag-badge tag-remove';
+      badge.title = 'Remove';
+      badge.textContent = '− ' + name;
+      diffRow.appendChild(badge);
+    });
 
     const applyBtn = document.createElement('button');
     applyBtn.className = 'apply-btn';
@@ -699,9 +857,9 @@ function buildPaneTagsField(docId, currentTags, sug, state) {
       refreshPane(docId);
     });
 
-    sugRow.appendChild(applyBtn);
-    sugRow.appendChild(rejectBtn);
-    div.appendChild(sugRow);
+    diffRow.appendChild(applyBtn);
+    diffRow.appendChild(rejectBtn);
+    div.appendChild(diffRow);
   }
   return div;
 }
@@ -712,10 +870,9 @@ document.getElementById('paneApplyAllBtn').addEventListener('click', async () =>
   if (!sug) return;
   const states = fieldStates.get(openPaneDocId) || {};
   for (const f of relevantFields(sug)) {
-    if ((states[f] || 'undecided') === 'undecided') {
-      await applyField(openPaneDocId, f, sug);
-    }
+    if ((states[f] || 'undecided') === 'undecided') await applyField(openPaneDocId, f, sug);
   }
+  openNextDocToReview(1);
 });
 
 document.getElementById('paneRejectAllBtn').addEventListener('click', () => {
@@ -727,13 +884,32 @@ document.getElementById('paneRejectAllBtn').addEventListener('click', () => {
     if ((states[f] || 'undecided') === 'undecided') setFieldState(openPaneDocId, f, 'rejected');
   }
   renderTable(filteredEntries);
-  refreshPane(openPaneDocId);
+  openNextDocToReview(1);
 });
 
-closePaneBtn.addEventListener('click', () => {
+document.getElementById('panePrevBtn').addEventListener('click', () => openNextDocToReview(-1));
+document.getElementById('paneNextBtn').addEventListener('click', () => openNextDocToReview(1));
+
+function closeReviewPane() {
   reviewPane.style.display = 'none';
+  paneBackdrop.style.display = 'none';
+  document.body.classList.remove('pane-open');
   openPaneDocId = null;
   entryRows.querySelectorAll('tr').forEach(tr => tr.classList.remove('row-selected'));
+}
+closePaneBtn.addEventListener('click', closeReviewPane);
+paneBackdrop.addEventListener('click', closeReviewPane);
+
+// ── Pane keyboard shortcuts ───────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (!openPaneDocId) return;
+  // Don't fire when user is typing in an input/textarea
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
+  if (e.key === 'ArrowRight' || e.key === 'l') { e.preventDefault(); openNextDocToReview(1); }
+  else if (e.key === 'ArrowLeft' || e.key === 'h') { e.preventDefault(); openNextDocToReview(-1); }
+  else if (e.key === 'a') { e.preventDefault(); document.getElementById('paneApplyAllBtn').click(); }
+  else if (e.key === 'r') { e.preventDefault(); document.getElementById('paneRejectAllBtn').click(); }
+  else if (e.key === 'Escape') { e.preventDefault(); closeReviewPane(); }
 });
 
 // ── Column filter dropdown ────────────────────────────────────────────────────
@@ -931,4 +1107,14 @@ refreshBtn.addEventListener('click', loadEntries);
 suggestBtn.addEventListener('click', generateSuggestions);
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+fetch('/api/settings').then(r => r.json()).then(s => { paperlessBaseUrl = (s.paperless_base_url || '').replace(/\/$/, ''); }).catch(() => {});
 loadEntries();
+// Reconnect to any in-progress queue (e.g. after page refresh)
+fetch('/api/suggestions/status').then(r => {
+  if (!r.ok) return;
+  return r.json();
+}).then(data => {
+  if (!data || data.completed >= data.total) return;
+  startPolling(data.total);
+  cancelQueueBtn.style.display = '';
+}).catch(() => {});

@@ -9,8 +9,75 @@
   <body>
     <header>
       <h1>Paperless Cleaner</h1>
-      <nav><a href="/settings">Settings</a></nav>
+      <nav style="display:flex;align-items:center;gap:1rem;">
+        <button id="helpBtn" class="btn-icon" title="Help &amp; shortcuts" style="font-size:1rem;color:var(--text-muted)">?</button>
+        <a href="/settings">Settings</a>
+      </nav>
     </header>
+
+    <!-- Help overlay -->
+    <div id="helpBackdrop" class="pane-backdrop" style="display:none"></div>
+    <div id="helpModal" class="help-modal" style="display:none">
+      <div class="help-header">
+        <strong>Help &amp; keyboard shortcuts</strong>
+        <button id="closeHelpBtn" class="btn-icon">✕</button>
+      </div>
+      <div class="help-body">
+
+        <h3>Workflow</h3>
+        <ol>
+          <li><strong>Refresh</strong> — loads all documents from Paperless-NGX and shows quality scores.</li>
+          <li><strong>Select documents</strong> — tick the checkboxes for documents you want to review, or leave all unchecked to queue every visible document.</li>
+          <li><strong>Generate suggestions</strong> — sends the selected documents to the LLM queue. A progress bar tracks processing; you can add more documents to the queue at any time without waiting for it to finish.</li>
+          <li><strong>Show suggestions</strong> — appears once at least one result is ready. Adds suggestion columns to the table with per-field Apply / Reject buttons.</li>
+          <li><strong>Review in pane</strong> — click any row to open the review pane. Apply or reject individual fields, or use "Apply &amp; Next" to act on the whole document and jump to the next one.</li>
+          <li><strong>Apply all approved</strong> — sends all applied changes to Paperless-NGX in one batch.</li>
+        </ol>
+
+        <h3>Table</h3>
+        <table class="help-table">
+          <thead><tr><th>Column</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td>Status</td><td>⚪ none · 🟡 queued · 🟢 ready · 🔵 done · ⚠ fallback</td></tr>
+            <tr><td>Quality</td><td>LLM score if available, otherwise heuristic (0 = worst, 100 = best). Sorted ascending by default.</td></tr>
+            <tr><td>Completeness</td><td>How many of the five key fields (title, tags, correspondent, doc type, date) are filled — 20 pts each.</td></tr>
+            <tr><td>Reviewed</td><td>Date this tool last applied changes to the document.</td></tr>
+          </tbody>
+        </table>
+        <p>Click any column header to sort or filter. Active filters appear as chips above the table.</p>
+
+        <h3>Review pane</h3>
+        <ul>
+          <li>Click a row to open it. Click the backdrop or press <kbd>Esc</kbd> to close.</li>
+          <li>Each field shows the current value; suggested changes appear below with <strong>Apply</strong> / <strong>Reject</strong> buttons.</li>
+          <li>Tags show a diff: <span style="color:#4ade80">+ additions</span> and <span style="color:#f87171;text-decoration:line-through">− removals</span>. Manual tags (matching algorithm = none) are never suggested for removal.</li>
+          <li>The <strong>‹ ›</strong> arrows in the header navigate to the previous / next document without acting.</li>
+          <li><strong>Apply &amp; Next →</strong> applies all remaining undecided suggestions and opens the next document with pending suggestions.</li>
+          <li><strong>Reject &amp; Next →</strong> rejects all remaining and moves to next.</li>
+          <li>The <em>Model reasoning</em> section (collapsed) shows the LLM's internal reasoning for transparency.</li>
+        </ul>
+
+        <h3>Keyboard shortcuts <small>(active when pane is open)</small></h3>
+        <table class="help-table">
+          <thead><tr><th>Key</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td><kbd>A</kbd></td><td>Apply all remaining &amp; go to next</td></tr>
+            <tr><td><kbd>R</kbd></td><td>Reject all remaining &amp; go to next</td></tr>
+            <tr><td><kbd>→</kbd> / <kbd>L</kbd></td><td>Next document (without acting)</td></tr>
+            <tr><td><kbd>←</kbd> / <kbd>H</kbd></td><td>Previous document (without acting)</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Close pane</td></tr>
+          </tbody>
+        </table>
+
+        <h3>State &amp; persistence</h3>
+        <ul>
+          <li>Apply / reject choices within a session are held in memory — they are lost on page refresh. Only the final "done" status and applied values are persisted in Paperless.</li>
+          <li>LLM quality scores, suggestion status, and review dates are stored as Paperless-NGX custom fields (<em>LLM quality</em>, <em>Suggestion status</em>, <em>Metadata reviewed</em>), so they are visible inside Paperless itself.</li>
+          <li>Pending / ready statuses are transient — they reset if the server restarts.</li>
+        </ul>
+
+      </div>
+    </div>
 
     <main id="mainLayout">
       <!-- Toolbar -->
@@ -24,10 +91,20 @@
 
       <!-- Progress bar -->
       <section id="progressSection" style="display:none">
-        <div class="progress-bar-track">
+        <div class="progress-bar-track" id="progressTrack" title="Click to show queue details">
           <div class="progress-bar-fill" id="progressFill"></div>
         </div>
         <span id="progressLabel" class="progress-label"></span>
+        <span id="progressEta" class="progress-eta"></span>
+      </section>
+
+      <!-- Queue detail panel -->
+      <section id="queuePanel" class="queue-panel" style="display:none">
+        <div class="queue-panel-header">
+          <strong>Queue details</strong>
+          <button id="closeQueuePanel" class="btn-icon">✕</button>
+        </div>
+        <div id="queuePanelBody" class="queue-panel-body"></div>
       </section>
 
       <!-- Active filters -->
@@ -37,9 +114,8 @@
         <button id="clearAllFilters" class="chip-clear-all">Clear all</button>
       </section>
 
-      <!-- Table + Review pane wrapper -->
+      <!-- Table -->
       <div id="tableAndPane">
-        <!-- Main table -->
         <section id="tableSection">
           <table id="mainTable">
             <thead>
@@ -60,28 +136,35 @@
             <tbody id="entryRows"></tbody>
           </table>
         </section>
+      </div>
 
-        <!-- Review pane -->
-        <aside id="reviewPane" class="review-pane" style="display:none">
-          <div class="pane-header">
-            <strong id="paneTitle">Document</strong>
+      <!-- Review pane modal -->
+      <div id="paneBackdrop" class="pane-backdrop" style="display:none"></div>
+      <aside id="reviewPane" class="review-pane" style="display:none">
+        <div class="pane-header">
+          <strong id="paneTitle">Document</strong>
+          <div class="pane-header-actions">
+            <a id="panePaperlessLink" href="#" target="_blank" rel="noopener" class="btn-icon" title="Open in Paperless ↗">↗</a>
+            <button id="panePrevBtn" class="btn-icon" title="Previous document (←)">‹</button>
+            <button id="paneNextBtn" class="btn-icon" title="Next document (→)">›</button>
             <button id="closePaneBtn" class="btn-icon" title="Close">✕</button>
           </div>
-          <div class="pane-thumb">
-            <img id="paneThumb" src="" alt="Thumbnail" />
-            <a id="panePreviewLink" href="#" target="_blank" rel="noopener">Open PDF ↗</a>
-          </div>
-          <div class="pane-fields" id="paneFields"></div>
-          <div class="pane-actions">
-            <button id="paneApplyAllBtn" class="btn-success" style="display:none">Apply all remaining</button>
-            <button id="paneRejectAllBtn" class="btn-danger" style="display:none">Reject all remaining</button>
-          </div>
-          <details id="paneReasoning" style="display:none">
-            <summary>Model reasoning</summary>
-            <p id="paneReasoningText" class="reasoning-text"></p>
-          </details>
-        </aside>
-      </div>
+        </div>
+        <div class="pane-thumb">
+          <img id="paneThumb" src="" alt="Thumbnail" />
+          <a id="panePreviewLink" href="#" target="_blank" rel="noopener">Open PDF ↗</a>
+        </div>
+        <div class="pane-fields" id="paneFields"></div>
+        <div class="pane-actions">
+          <button id="paneApplyAllBtn" class="btn-success" style="display:none">Apply &amp; Next →</button>
+          <button id="paneRejectAllBtn" class="btn-danger" style="display:none">Reject &amp; Next →</button>
+        </div>
+        <div class="pane-shortcuts">A = apply &amp; next &nbsp;·&nbsp; R = reject &amp; next &nbsp;·&nbsp; ← → = navigate</div>
+        <details id="paneReasoning" style="display:none">
+          <summary>Model reasoning</summary>
+          <p id="paneReasoningText" class="reasoning-text"></p>
+        </details>
+      </aside>
 
       <!-- Column filter dropdown (shared, moved by JS) -->
       <div id="columnFilterDropdown" class="col-filter-dropdown" style="display:none">

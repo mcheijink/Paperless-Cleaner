@@ -1,26 +1,26 @@
 # Paperless Cleaner — Specification
 
-> Working document. Edit freely before implementation begins.
+> This document reflects the current implemented state of the application.
 
 ---
 
 ## 1. Purpose
 
-Paperless Cleaner is a self-hosted web application that sits alongside a Paperless-NGX instance and helps users improve the metadata quality of their document library — titles, tags, correspondents, and document types — through sorting, scoring, and bulk suggestion workflows.
+Paperless Cleaner is a self-hosted web application that sits alongside a Paperless-NGX instance and helps users improve the metadata quality of their document library — titles, tags, correspondents, and document types — through sorting, scoring, and a keyboard-driven suggestion review workflow.
 
 ---
 
 ## 2. Architecture overview
 
 ```
-Browser  ←→  FastAPI (port 8080)  ←→  Paperless-NGX API
-                                  ←→  Ollama API (optional)
+Browser  ←→  FastAPI (internal port 8080, exposed as 8200)  ←→  Paperless-NGX API
+                                                             ←→  Ollama API (optional)
 ```
 
-- **Backend**: Python / FastAPI. Stateless except for `app/settings.json`.
+- **Backend**: Python / FastAPI. State: `app/settings.json` (connection config only). All document data lives in Paperless-NGX, including quality scores and suggestion status (stored as custom fields).
 - **Frontend**: Vanilla HTML/CSS/JavaScript. Two pages: main (`/`) and settings (`/settings`).
-- **No database**. All document data is fetched live from Paperless-NGX.
-- **Docker Compose** for deployment. Single service, port 8080.
+- **No local database**. All document state is fetched live from Paperless-NGX.
+- **Docker Compose** for deployment. Single service; host port `8200`, container port `8080`.
 
 ---
 
@@ -28,7 +28,7 @@ Browser  ←→  FastAPI (port 8080)  ←→  Paperless-NGX API
 
 ### 3.1 Settings
 
-Persisted in `app/settings.json`. Seeded from environment variables on first run if the file is absent.
+Persisted in `app/settings.json`. Seeded from environment variables on first run if the file is empty.
 
 | Field | Type | Default | Env var |
 |---|---|---|---|
@@ -41,88 +41,95 @@ Persisted in `app/settings.json`. Seeded from environment variables on first run
 | `confidence_discount` | float | `0.2` | `CONFIDENCE_DISCOUNT` |
 | `few_shot_min_documents` | int | `5` | `FEW_SHOT_MIN_DOCUMENTS` |
 
-- `ollama_temperature`: `0.0` gives deterministic output, which is strongly preferred for structured metadata extraction. Can be raised slightly (e.g. `0.1`) if the model produces repetitive results.
-- `confidence_discount`: subtracted from all LLM-reported confidence scores before the 0.8 threshold is applied. Local models are systematically overconfident; a discount of 0.2 means the model must report ≥ 1.0 for a new tag to default on, effectively making the "Create & apply" toggle default to off until the user adjusts this setting.
-- `few_shot_min_documents`: minimum number of user-reviewed documents (those with `suggestion_status = "done"` and at least one field applied) required before library examples are used in the prompt. Falls back to generic built-in examples below this threshold.
+- `ollama_temperature`: `0.0` gives deterministic output. Can be raised slightly if the model produces repetitive results.
+- `confidence_discount`: subtracted from all LLM-reported confidence scores. Local models are systematically overconfident.
+- `few_shot_min_documents`: minimum reviewed documents before library examples are used in the prompt. Falls back to generic built-in examples below this threshold.
 
 ### 3.2 Entry (document as seen by the UI)
 
 ```
 id                      int
 title                   string
-correspondent           string | null   — resolved name (not ID); displayed as "—" if null
-document_type           string | null   — resolved name (not ID); displayed as "—" if null
+correspondent           string | null   — resolved name; displayed as "—" if null
+document_type           string | null   — resolved name; displayed as "—" if null
 date                    string | null   — ISO date (created date from Paperless)
-tags                    string[]        — resolved tag names (not IDs)
-heuristic_quality       int             — 0–100, see §5 tier 1
-llm_quality             int | null      — 0–100, see §5 tier 2; null until LLM has been run
-metadata_completeness   int             — 0–100, see §5 tier 3
+tags                    string[]        — resolved tag names
+heuristic_quality       int             — 0–100, computed locally (see §5.1)
+llm_quality             int | null      — 0–100, stored in "LLM quality" custom field; null until LLM run
+metadata_completeness   int             — 0–100, computed locally (see §5.3)
 suggestion_status       string          — "none" | "pending" | "ready" | "done"
-metadata_reviewed       string | null   — ISO date when metadata was last changed by this tool; null if never touched
+metadata_reviewed       string | null   — ISO date from "Metadata reviewed" custom field; null if never touched
 ```
 
 **`suggestion_status` values:**
-- `"none"` — no suggestion has been requested for this document
-- `"pending"` — document is queued or currently being processed by Ollama
-- `"ready"` — suggestion generated; at least one suggested field is still undecided (neither applied nor rejected)
-- `"done"` — all suggested fields have been resolved (applied or rejected); no further attention needed
+- `"none"` — no suggestion has been requested
+- `"pending"` — document is queued or being processed (transient in-memory; resets on server restart)
+- `"ready"` — suggestion generated; at least one field is still undecided (transient in-memory; resets on server restart)
+- `"done"` — all suggested fields resolved; stored in the "Suggestion status" Paperless custom field
 
-Status transitions to `"done"` automatically when the last undecided field is either applied or rejected. It does not distinguish between "everything applied" and "everything rejected" — both mean the document is fully reviewed.
+Status transitions to `"done"` automatically when the last undecided field is applied or rejected.
 
-### 3.3 SuggestedTag
+### 3.3 Paperless custom fields
+
+Three custom fields are auto-created at startup if they do not exist:
+
+| Field name | Data type | Purpose |
+|---|---|---|
+| `LLM quality` | Integer | LLM's assessment of the title (0–100) |
+| `Suggestion status` | String | `"done"` once fully reviewed (persistent across restarts) |
+| `Metadata reviewed` | Date | ISO date of the last apply operation |
+
+### 3.4 SuggestedTag
 
 ```
 name          string   — tag name
-confidence    float    — 0.0–1.0, self-reported by the LLM
-is_new        bool     — true if the tag does not exist in Paperless-NGX
+confidence    float    — 0.0–1.0, self-reported by the LLM; reduced by confidence_discount
+is_new        bool     — true if tag does not exist in Paperless-NGX
 ```
 
-### 3.4 SuggestedField
+### 3.5 SuggestedField
 
-A single-value suggestion with a confidence score. Used for correspondent and document type.
-
-```
-name          string   — suggested value (must be an existing name in Paperless-NGX)
-confidence    float    — 0.0–1.0, self-reported by the LLM
-```
-
-### 3.5 Suggestion
+Used for correspondent and document type.
 
 ```
-id                         int                — document ID
-title_quality              int | null         — LLM's assessment of the current title quality (0–100);
-                                                null for heuristic provider (no semantic scoring)
-detected_language          string | null      — language detected in the document (e.g. "Dutch", "German");
-                                                null for heuristic provider
-reasoning                  string | null      — LLM's chain-of-thought before committing to values;
-                                                null for heuristic provider
+name          string   — must be an existing value in Paperless-NGX (case-insensitive match)
+confidence    float    — 0.0–1.0
+```
+
+### 3.6 Suggestion
+
+```
+id                         int
+title_quality              int | null         — LLM's assessment of the current title (0–100); null for heuristic
+detected_language          string | null      — e.g. "Dutch", "German"; null for heuristic
+reasoning                  string | null      — LLM chain-of-thought; null for heuristic
 suggested_title            string
-suggested_correspondent    SuggestedField | null   — null if LLM has no suggestion or is confident current value is correct
-suggested_document_type    SuggestedField | null   — null if LLM has no suggestion or is confident current value is correct
+suggested_correspondent    SuggestedField | null
+suggested_document_type    SuggestedField | null
 suggested_tags             SuggestedTag[]
-reason                     string             — human-readable summary of why changes were suggested
+protected_tags             string[]           — manual tag names (never shown as removals in the diff)
+reason                     string             — one-sentence human-readable summary
+fallback_used              bool               — true if Ollama failed and heuristic was used
 ```
 
-Note: `reasoning` (internal chain-of-thought) and `reason` (human-readable summary) are distinct fields. `reasoning` is shown collapsed in the review pane for transparency; `reason` is shown prominently.
+`suggested_correspondent` and `suggested_document_type` are `null` if the LLM has no improvement to suggest or the current value is already correct. The backend discards any suggestion that matches the current value (case-insensitive), preventing no-op suggestions.
 
-### 3.6 ApplyItem
+### 3.7 ApplyItem
 
 ```
 id                int
-title             string | null    — if null, title is not updated
-correspondent     string | null    — if null, correspondent is not updated
-document_type     string | null    — if null, document type is not updated
-tags              string[] | null  — if null, tags are not updated
-tags_new          string[]         — names of new tags to create and apply; ignored entirely if tags is null
+title             string | null    — null = do not update
+correspondent     string | null    — null = do not update
+document_type     string | null    — null = do not update
+tags              string[] | null  — null = do not update
+tags_new          string[]         — new tag names to create before applying
 ```
-
-All fields except `id` are nullable. Only non-null fields are included in the Paperless-NGX PATCH payload. This supports per-field apply from both the table comparison view and the document review pane.
 
 ---
 
 ## 4. API endpoints
 
-All endpoints are served by FastAPI. Request and response bodies are JSON.
+All endpoints served by FastAPI. Request/response bodies are JSON.
 
 ### 4.1 `GET /`
 Returns the main page (HTML).
@@ -131,207 +138,133 @@ Returns the main page (HTML).
 Returns the settings page (HTML).
 
 ### 4.3 `GET /api/settings`
-Returns the current settings object. The `paperless_token` value is masked — the actual token is never transmitted to the browser.
-
-**Response**
-```json
-{
-  "paperless_base_url": "http://...",
-  "paperless_token": "***",
-  "ollama_base_url": "http://...",
-  "ollama_model": "llama3.1",
-  "suggestion_provider": "ollama"
-}
-```
-
-The settings page uses the masked value solely to indicate that a token is configured. Submitting the settings form only updates the token if the submitted value is not `"***"`.
+Returns current settings. `paperless_token` is masked as `"***"`.
 
 ### 4.4 `POST /api/settings`
-Saves new settings to `app/settings.json`.
+Saves settings to `app/settings.json`. Token is only updated if the submitted value is not `"***"`.
 
-**Request body**: same shape as `GET /api/settings` response.
+**Response**: `{ "status": "ok" }`
 
-**Response**
-```json
-{ "status": "ok" }
-```
+### 4.5 `GET /api/entries`
+Fetches all documents from Paperless-NGX, resolves tag/correspondent/document_type IDs to names, reads custom field values, computes quality scores, overlays transient in-memory status, and returns an array of Entry objects.
 
-### 4.5 `GET /api/entries?sort_by=<name|tags|quality>`
-Fetches all documents from Paperless-NGX, resolves tag IDs to names, computes quality scores, and returns a sorted list.
-
-**Query parameter**: `sort_by` — `name` (default, A→Z), `tags` (descending), `quality` (ascending, worst first — uses `llm_quality` if available, otherwise `heuristic_quality`).
-
-**Response**: array of Entry objects (see §3.2).
-
-**Error**: `502` if Paperless-NGX is unreachable or returns an error.
-
-### 4.6 `POST /api/suggestions`
-Generates metadata suggestions for the given document IDs.
-
-**Request body**
-```json
-{ "ids": [1, 2, 3] }
-```
-
-**Response**: array of Suggestion objects (see §3.5).
-
-**Behaviour**:
-- Fetches fresh document data, full tag map, correspondent map, and document type map from Paperless-NGX.
-- For each ID, calls the configured suggestion provider.
-- Each SuggestedTag `is_new` flag is determined by case-insensitive name match against the Paperless-NGX tag map.
-- `suggested_correspondent` and `suggested_document_type` are only set to a name that already exists in Paperless-NGX (case-insensitive match). The LLM cannot create new correspondents or document types.
-- The returned `title_quality` score is stored in `settings.json` keyed by document ID so subsequent `GET /api/entries` calls can return it as `llm_quality`.
-- If provider is `"ollama"` and the Ollama call fails, falls back to heuristic. The UI shows a warning indicator on that document's row to indicate the fallback occurred.
-- Documents not found in Paperless-NGX are skipped (no error).
-- Sets `suggestion_status` to `"ready"` for each successfully processed document.
+**Response**: array of Entry objects (§3.2).
 
 **Error**: `502` if Paperless-NGX is unreachable.
 
-### 4.7 `GET /api/suggestions/status?job_id=<id>`
-Returns the current state of a suggestion job.
+### 4.6 `POST /api/suggestions`
+Adds document IDs to the global suggestion queue. Deduplicates — IDs already in the queue are skipped.
+
+**Request body**: `{ "ids": [1, 2, 3] }`
+
+**Response**: `{ "newly_added": 2, "total": 5 }` — `total` reflects the cumulative global queue size.
+
+**Behaviour**:
+- Fetches fresh documents, tags, correspondents, and document types from Paperless-NGX.
+- Adds valid IDs to the single persistent global job (`_global_job`). Multiple calls accumulate into one job.
+- Marks new items as `"pending"` in transient in-memory state.
+- Returns immediately; processing happens in the background worker.
+
+### 4.7 `GET /api/suggestions/status`
+Returns the current state of the global suggestion job.
 
 **Response**
-```json
-{ "job_id": "abc123", "total": 5, "completed": 2, "results": [ ...Suggestion objects... ] }
-```
-
-### 4.8 `DELETE /api/suggestions/queue`
-Cancels all pending (not yet started) items in the suggestion queue. The document currently being processed by Ollama completes normally.
-
-**Response**
-```json
-{ "status": "ok", "cancelled": 3 }
-```
-
-### 4.9 `POST /api/apply`
-Applies a list of approved changes back to Paperless-NGX, optionally creating new tags first. Supports per-field updates — set `title` or `tags` to `null` to leave that field unchanged.
-
-**Request body**
 ```json
 {
-  "entries": [
-    {
-      "id": 1,
-      "title": "New Title",
-      "tags": ["tag-a", "tag-b"],
-      "tags_new": ["acme-corp"]
-    }
-  ]
+  "total": 5,
+  "completed": 3,
+  "results": [ ...Suggestion objects... ],
+  "items": [ { "doc_id": 1, "title": "...", "status": "done", "started_at": 1234, "finished_at": 1235 } ],
+  "elapsed_seconds": 42.1,
+  "avg_seconds_per_doc": 14.0,
+  "eta_seconds": 28
 }
 ```
 
+**Error**: `404` if no job exists yet (or after cancel).
+
+### 4.8 `DELETE /api/suggestions/queue`
+Drains all pending items from the queue and resets the global job to `null`. The document currently being processed completes normally.
+
+**Response**: `{ "status": "ok", "cancelled": 3 }`
+
+### 4.9 `POST /api/apply`
+Applies approved changes to Paperless-NGX and writes the three custom field values.
+
+**Request body**: `{ "entries": [ ApplyItem, ... ] }`
+
 **Behaviour**:
-- Fetches the current tag map from Paperless-NGX to resolve tag names → IDs.
-- Resolves the `"Metadata reviewed"` custom field ID (see §9.1); creates the field if it does not exist.
-- For each name in `tags_new`, creates the tag via `POST /api/tags/` and adds the new ID to the set to apply.
-- Tags in `tags` not found in Paperless-NGX are dropped (should not occur if the UI is correct).
-- Only includes non-null fields in the `PATCH` payload per document.
-- Always includes `"Metadata reviewed"` set to today's ISO date in the `PATCH` payload, regardless of which fields were changed.
-- Updates `suggestion_status` to `"done"` for each successfully updated document.
+- For each name in `tags_new`, creates the tag via `POST /api/tags/`.
+- PATCHes each document with only non-null fields plus the three custom fields: `LLM quality`, `Suggestion status` (set to `"done"`), `Metadata reviewed` (today's ISO date).
+- Preserves manual tags (matching algorithm = 0) by fetching the current tag list before patching.
+- Updates transient `suggestion_status` to `"done"` for each document.
 
-**Response**
-```json
-{ "status": "ok", "updated": 3, "tags_created": ["acme-corp"] }
-```
-
-**Error**: `502` if any Paperless-NGX request fails.
+**Response**: `{ "status": "ok", "updated": 3, "tags_created": ["acme-corp"] }`
 
 ### 4.10 `GET /api/documents/{id}/thumb`
-Proxies the document thumbnail from Paperless-NGX. The Paperless token is added server-side; the browser never needs direct access to Paperless.
+Proxies the document thumbnail from Paperless-NGX. Paperless token added server-side.
 
-**Response**: JPEG image stream, content-type `image/jpeg`.
+**Response**: JPEG image stream.
 
 ### 4.11 `GET /api/documents/{id}/preview`
-Proxies the full document preview (PDF) from Paperless-NGX, streamed to avoid loading the entire file into memory.
+Proxies the full PDF from Paperless-NGX, streamed.
 
-**Response**: PDF stream, content-type `application/pdf`.
+**Response**: PDF stream.
 
 ---
 
 ## 5. Quality scoring
 
-Quality is tracked as three separate scores per document, each measuring a different dimension.
+### 5.1 Heuristic quality score
 
-### 5.1 Heuristic quality score (tier 1)
+Computed locally on every load. Range 0–100.
 
-Computed locally on every page load. No LLM call required. Range: 0–100.
+**Word count**:
 
-**Word count** (primary signal — a good title is 3–6 words):
-
-| Word count | Points |
+| Count | Points |
 |---|---|
 | 3–6 words | 60 |
-| 2 words | 35 |
-| 7+ words | 35 |
+| 2 or 7+ words | 35 |
 | 1 word | 15 |
 | 0 words / empty | 0 |
 
-**Casing** (sentence case is the target convention):
+**Casing**:
 
 | Criterion | Points |
 |---|---|
-| Sentence case (first word capitalised, rest lowercase) | 15 |
-| At least one capital letter | 5 |
+| Sentence case | 15 |
+| At least one capital | 5 |
 | All lowercase | 0 |
 
-**Tags** (presence of tags is a signal of a processed document):
+**Tags**: 9 pts × tag count, capped at 3 tags (0–27 pts).
 
-| Criterion | Points |
-|---|---|
-| Tags: 9 pts × tag count, capped at 3 tags | 0–27 |
-
-**Penalties** (applied after summing; score floors at 0):
+**Penalties** (applied after summing; floor at 0):
 
 | Pattern | Penalty |
 |---|---|
-| Filename-like: underscores with no spaces, or matches `scan\d+` / `doc_` / `IMG_` / all-digit string | −30 |
-| High digit ratio: >40% of characters are digits | −20 |
+| Filename-like (underscores, `scan\d+`, `doc_`, `IMG_`, all-digit) | −30 |
+| High digit ratio (>40% of chars are digits) | −20 |
 
-Maximum score: 102 (rounded to 100). A 3–6 word sentence-case title with 3+ tags and no bad patterns scores 100.
+### 5.2 LLM quality score
 
-### 5.2 LLM quality score (tier 2)
+Returned by the LLM when generating suggestions. Stored in the "LLM quality" Paperless custom field. Range 0–100; `null` until LLM has been run.
 
-Returned by the LLM when generating suggestions (see §6.1). Stored in `settings.json` keyed by document ID. Range: 0–100, `null` until the LLM has been run for that document.
+When sorting by **Quality**, `llm_quality` is used if available; otherwise `heuristic_quality`.
 
-Reflects semantic quality: does the title actually describe the content of the document in 3–6 words, in sentence case, without redundant metadata?
+### 5.3 Metadata completeness score
 
-**Sort order**: when sorting by quality, `llm_quality` is used if available; otherwise `heuristic_quality` is used as the fallback.
-
-### 5.3 Metadata completeness score (tier 3)
-
-Computed locally on every page load. Measures how many of the five key Paperless-NGX metadata fields are filled. Range: 0–100.
-
-| Field | Points | Condition |
-|---|---|---|
-| Title | 20 | Non-empty and not a filename pattern (heuristic_quality > 0) |
-| Tags | 20 | At least one tag assigned |
-| Correspondent | 20 | Not null |
-| Document type | 20 | Not null |
-| Date | 20 | Not null |
-
-A document with all five fields populated scores 100. This score is complementary to the quality scores — a document can have a perfect title quality score but still score 40% on completeness if correspondent and document type are missing.
+Computed locally. 20 pts each for: non-empty title (not filename-like), at least one tag, correspondent not null, document type not null, date not null. Range 0–100.
 
 ---
 
 ## 6. Title convention
 
-A well-formed title in this library:
-
-- Is in **sentence case** — first word capitalised, rest lowercase (e.g. `Kfz versicherungsschein renewal`, not `KFZ Versicherungsschein Renewal`)
-- Is **3–6 words** — concise enough to scan at a glance
-- Describes the **specific subject** of the document — what it is about, not what type it is
-- Contains **no redundant metadata** — correspondent, document type, and date are all stored as separate fields in Paperless-NGX and displayed alongside the title; they must not be repeated in the title
-- Contains **no reference numbers, policy numbers, or scanner-generated strings** — these are present in the OCR-extracted content and are fully searchable without appearing in the title
-- Is written in the **language of the document**
-
-Examples:
-
-| Current (bad) | Improved |
-|---|---|
-| `scan0047` | `Electricity bill January` |
-| `Versicherungsschein_Kfz-Versicherung_AD-9512372748_2026-03-20` | `Kfz versicherungsschein renewal` |
-| `20231015123456` | `Salary statement October` |
-| `IMG_20240302_invoice_final_v2` | `Freelance invoice Q1` |
+A well-formed title:
+- **Sentence case** — first word capitalised, rest lowercase
+- **3–6 words** — concise
+- **Describes the specific subject** — not the document type, correspondent, or date (those are separate fields)
+- **No reference numbers or scanner strings** — fully searchable in Paperless OCR
+- **Written in the document's language**
 
 ---
 
@@ -339,265 +272,168 @@ Examples:
 
 ### 7.1 Ollama
 
-Uses the **Instructor** library with Ollama rather than raw `format: "json"`. Instructor provides schema-enforced structured output with automatic retry on malformed responses, and avoids the ~10× inference slowdown associated with Ollama's GBNF grammar mode.
+Uses the **Instructor** library with Ollama's OpenAI-compatible `/v1` endpoint (`instructor.from_openai` + `AsyncOpenAI(base_url=f"{ollama_url}/v1", api_key="ollama")`). Instructor enforces the response schema and retries on malformed output.
 
-#### Step 1 — Language detection
+#### Language detection
 
-Before calling the main model, a lightweight language detection step determines the document's primary language from the first 500 characters of OCR content. This is performed using the `langdetect` Python library (fast, no model call required). The detected language name (e.g. `"Dutch"`, `"German"`) is passed into the main prompt so the model knows which language to write the title in.
+Before the main call, `langdetect` runs on the first 500 characters of OCR content. The detected language name is passed into the prompt. Falls back to `"unknown"` on failure.
 
-If detection fails or is ambiguous, the language is passed as `"unknown"` and the model is instructed to match the language of the document content.
-
-#### Step 2 — Metadata extraction prompt
-
-The system prompt follows this structure (format constraints first, then schema, then examples, then negative constraints):
+#### System prompt structure
 
 ```
+/no_think                          ← suppresses qwen3 thinking mode
+
 ## Output format
-Respond with a single valid JSON object. No text outside the JSON.
+Respond with a single valid JSON object.
 
 ## JSON schema
-{
-  "reasoning":             string   -- 1–2 sentences: how you determined each field
-  "title_quality":         int      -- 0–100: quality of the CURRENT title
-  "suggested_title":       string   -- sentence case, 3–6 words, in {LANGUAGE}
-  "suggested_correspondent": { "name": string, "confidence": float } | null
-  "suggested_document_type": { "name": string, "confidence": float } | null
-  "suggested_tags":        [ { "name": string, "confidence": float } ]
-  "reason":                string   -- one sentence summary for the user
-}
+{ reasoning, title_quality, suggested_title, suggested_correspondent,
+  suggested_document_type, suggested_tags, reason }
 
 ## Allowed values
-Tags (select from this list only):         {ALL_TAG_NAMES}
-Correspondents (select from this list only): {ALL_CORRESPONDENT_NAMES}
-Document types (select from this list only): {ALL_DOCUMENT_TYPE_NAMES}
+Tags: {AUTO_TAG_NAMES}             ← auto-matched tags only; manual tags listed separately
+Correspondents: {ALL_CORRESPONDENT_NAMES}
+Document types: {ALL_DOCUMENT_TYPE_NAMES}
+
+## Protected tags (do not suggest removing these)
+{MANUAL_TAG_NAMES}
 
 ## Examples
 {FEW_SHOT_EXAMPLES}
 
 ## Rules
-- Title must be sentence case (first word capitalised, rest lowercase) in {LANGUAGE}
-- Title must be 3–6 words
-- Title must describe the subject only — do not include the correspondent,
-  document type, date, or reference numbers; these are stored separately
-- Only suggest a correspondent, document type, or tag if it is in the lists above
-- Set suggested_correspondent and suggested_document_type to null if the
-  current value is already appropriate or you are not confident
-- Confidence is 0.0–1.0; be conservative; discount your certainty by 20% if unsure
-- Do not invent new tags, correspondents, or document types
-
-## Do not
-- Include markdown, commentary, or any text outside the JSON
-- Add fields not in the schema
-- Translate the title; keep it in {LANGUAGE}
+- Title: sentence case, 3–6 words, in {LANGUAGE}, subject only
+- Suggest correspondent/document_type only if current value is wrong or missing
+- Confidence 0.0–1.0; be conservative
+- Do not invent tags/correspondents/document_types not in the lists
 ```
 
-**Document context passed in the user message**:
-- Current title
-- Correspondent (resolved name or `"unknown"`)
-- Document type (resolved name or `"unknown"`)
-- Created date (ISO format or `"unknown"`)
-- Currently applied tags
-- First 500 characters of OCR content
+User message includes: current title, correspondent, document type, date, tags, first 500 chars of content.
 
 #### Few-shot examples
 
-Examples in the prompt are drawn from the user's own library where available:
-
-- **Sufficient library examples** (≥ `few_shot_min_documents` documents with `suggestion_status = "done"` and at least one field applied): 2–3 documents are selected from this pool, preferring variety of document type and correspondent.
-- **Insufficient library examples**: 2–3 generic built-in examples are used instead (hard-coded in the application, covering common document types).
-
-The prompt always contains exactly 2–3 examples. Library examples are more effective because they reflect the user's actual naming conventions.
-
-#### Confidence discount
-
-All `confidence` values returned by the model are reduced by `confidence_discount` (default `0.2`) before being used in the UI threshold logic (e.g. the 0.8 threshold for defaulting the "Create & apply" toggle on new tags).
+Drawn from the user's own reviewed library if ≥ `few_shot_min_documents` documents have `suggestion_status = "done"` with at least one field applied. Otherwise uses built-in generic examples. Always 2–3 examples.
 
 #### Backend validation
 
-After parsing the Instructor response, the backend validates:
-- `suggested_title` word count is between 1 and 10 (reject if outside range)
-- `suggested_correspondent.name` exists in the Paperless-NGX correspondent map (case-insensitive); discard if not
-- `suggested_document_type.name` exists in the Paperless-NGX document type map (case-insensitive); discard if not
-- `suggested_tags` entries with `is_new: false` must exist in the tag map (case-insensitive); discard invalid ones
-
-Falls back to heuristic on any unrecoverable error (network failure, Instructor retry exhausted, schema validation failed). The UI shows a ⚠️ warning indicator on the affected row.
+After parsing the Instructor response:
+- `suggested_correspondent.name` must exist in Paperless (case-insensitive); discarded otherwise
+- `suggested_document_type.name` must exist in Paperless; discarded otherwise
+- Correspondent/document_type are discarded if they match the current value (no-op suppression)
+- `suggested_tags` entries with `is_new: false` must exist in the tag map; invalid ones discarded
+- Falls back to heuristic on any unrecoverable error; sets `fallback_used = true`
 
 ### 7.2 Heuristic
 
-Local, offline. No external calls.
-
-- **Title**: capitalises each word and replaces underscores with spaces. Word boundaries are spaces only — hyphens are not treated as separators.
-- **Tags**: not modified — returns the document's existing tags unchanged. Tag improvements require an LLM with access to document content.
-- **Correspondent**: not modified — no suggestion.
-- **Document type**: not modified — no suggestion.
-- **`title_quality`**: returns `null` — the heuristic has no semantic understanding of title quality.
-- **Reason**: fixed string `"Title normalized. Correspondent, document type, and tag suggestions require an LLM provider."`
+Local, offline. Capitalises each word, replaces underscores with spaces. Does not suggest tags, correspondent, or document type changes. Returns `title_quality = null`.
 
 ---
 
-## 8. Frontend pages
+## 8. Frontend
 
 ### 8.1 Main page (`/`)
 
 #### Layout
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Paperless Cleaner                          [Settings]   │
-├─────────────────────────────────────────────────────────┤
-│  [Refresh]  [Generate suggestions ▸]                    │
-│  [Show suggestions (3 ready)]  [Apply all approved (2)] │
-├─────────────────────────────────────────────────────────┤
-│  Active filters: Correspondent: ADAC ×   Quality < 50 × │
-├──┬────────┬────────────┬───────────────┬─────┬──────────┤
-│☑ │Status ▾│Title      ▾│Correspondent ▾│Tags▾│Quality  ▾│
-├──┼────────┼────────────┼───────────────┼─────┼──────────┤
-│  │  🟢   │ scan0047   │ ADAC          │ ... │  12      │
-│  │  🟡   │ 20231015.. │ Belasting..   │ ... │   8      │
-│  │  ⚪   │ Contract.. │ ING           │ ... │  75      │
-└──┴────────┴────────────┴───────────────┴─────┴──────────┘
-                                                           │
-                                        [Document pane]   │
+┌─────────────────────────────────────────────────────────────┐
+│  Paperless Cleaner                            [?] [Settings] │
+├─────────────────────────────────────────────────────────────┤
+│  [Refresh] [Generate suggestions] [Show suggestions (N)]    │
+│  [Apply all approved (N)]  [Cancel queue]                   │
+├─────────────────────────────────────────────────────────────┤
+│  ████████░░░░  Processing 3 of 5 · ~14 s/doc · ETA 28 s    │
+├─────────────────────────────────────────────────────────────┤
+│  Active filters: Correspondent: ADAC ×   Quality < 50 ×     │
+├──┬────────┬────────────┬───────────┬──────┬──────┬──────────┤
+│☑ │Status ▾│Title      ▾│Corresp.  ▾│Tags ▾│Qual ▾│Complete ▾│
+├──┼────────┼────────────┼───────────┼──────┼──────┼──────────┤
+│  │  🟢   │ scan0047   │ ADAC      │ ...  │  12  │   40     │
+└──┴────────┴────────────┴───────────┴──────┴──────┴──────────┘
 ```
 
-**Columns**: ☑ (select) | Status | Title | Correspondent | Document type | Date | Tags | Quality | Completeness | Reviewed
+**Columns**: ☑ | Status | Title | Correspondent | Document type | Date | Tags | Quality | Completeness | Reviewed
 
-- **Quality** shows `llm_quality` if available, otherwise `heuristic_quality`.
-- **Completeness** shows `metadata_completeness` (0–100).
-- **Reviewed** shows the `metadata_reviewed` date (or empty if never touched by this tool).
-- `null` values for correspondent, document type, and date are displayed as `—`.
+When "Show suggestions" is active: Suggested title | Suggested correspondent | Suggested document type | Suggested tags columns are added.
 
-When "Show suggestions" is active, two additional columns appear between the originals and Quality: **Suggested title** | **Suggested tags**.
+#### Column header controls
 
-#### Column header controls (Excel-style)
+Clicking a header opens a dropdown with sort and filter options. Filter types:
+- *Title*: text search (substring)
+- *Correspondent, Document type, Status*: checkbox list
+- *Tags*: checkbox list (document matches if it has any checked tag)
+- *Quality, Completeness*: min/max range
+- *Date, Reviewed*: date range; Reviewed also has "Never reviewed" checkbox
 
-Clicking any column header opens a dropdown containing:
+Active filters show as removable chips above the table. All filtering and sorting is client-side.
 
-- **Sort ascending / Sort descending** — clicking again toggles direction; an arrow indicator on the header shows the active sort
-- **Column-specific filter**:
-  - *Title*: free text search (substring match)
-  - *Correspondent, Document type, Status*: checkbox list of all values present in the current data
-  - *Tags*: checkbox list of all tag names — a document matches if it has any of the checked tags
-  - *Quality*: range slider (min / max)
-  - *Date*: date range picker (from / to)
-  - *Reviewed*: date range picker, plus a "Never reviewed" checkbox to show only untouched documents
-- **Clear filter** — removes the filter for this column
-
-Active filters are shown as removable chips in a filter bar above the table. A "Clear all filters" button removes all at once. Filtering and sorting are applied client-side on the loaded dataset — no re-fetch required.
-
-#### Suggestion status indicator
-
-Each row has a coloured status dot in the Status column:
+#### Status dots
 
 | Dot | Status | Meaning |
 |---|---|---|
 | ⚪ Grey | `none` | No suggestion requested |
-| 🟡 Yellow | `pending` | Queued or being processed by Ollama |
-| 🟢 Green | `ready` | Suggestion generated; at least one field still undecided |
-| 🔵 Blue | `done` | All suggested fields resolved (applied or rejected); no attention needed |
-| ⚠️ Orange | — | Ollama failed; heuristic fallback was used |
+| 🟡 Yellow | `pending` | Queued / processing (transient) |
+| 🟢 Green | `ready` | Suggestion ready; undecided fields remain (transient) |
+| 🔵 Blue | `done` | All fields resolved; stored in Paperless |
+| ⚠ Orange | — | Ollama failed; heuristic fallback used |
 
-#### Show suggestions toggle
+#### Progress bar
 
-A toolbar button **"Show suggestions (N ready)"** where N is the count of documents with `suggestion_status = "ready"`. When active:
-- The table gains **Suggested title**, **Suggested correspondent**, **Suggested document type**, and **Suggested tags** columns.
-- Each suggestion cell shows the suggested value with a per-field **Apply** button and a **Reject** (✕) button.
-- Rows without a ready suggestion show an empty cell in those columns.
-- Applied fields show a ✓ indicator; rejected fields show a strikethrough. Once all fields in a row are applied or rejected the row status updates to 🔵 "done" automatically.
+Appears while the suggestion queue is running. Shows `completed / total`, average time per document, and ETA. Clicking the bar opens the **queue detail panel** which lists each document with its processing status and duration.
 
 #### Document review pane
 
-Clicking any table row opens a right-side panel:
+Opens as a **centred modal** when clicking any row. Contains:
+- Document thumbnail (proxied from Paperless) with link to open the full PDF
+- Link to open the document in Paperless-NGX (`↗`)
+- Detected language label (`🌐 Dutch`)
+- Each field (Title, Correspondent, Document type, Tags) with:
+  - Current value
+  - Suggested change (if any and undecided) with per-field **Apply** / **Reject** buttons
+  - Applied fields: `✓ Applied`; rejected fields: greyed out strikethrough
+- **Tag diff**: green `+` badges for additions, red strikethrough `−` badges for removals. Manual tags (matching_algorithm = 0) are listed as protected and never appear as removals.
+- **Apply & Next →** — applies all remaining undecided suggestions and opens the next document with actionable suggestions (wraps; closes pane if none remain)
+- **Reject & Next →** — same but rejects
+- **‹ ›** nav arrows in the header — navigate without acting
+- **Model reasoning** — collapsible section with the LLM's chain-of-thought
+- Keyboard shortcuts hint line
 
-- **Left**: document thumbnail (from `GET /api/documents/{id}/thumb`) with a link to open the full PDF preview in a new tab (`GET /api/documents/{id}/preview`).
-- **Right**: metadata fields in a layout similar to the Paperless-NGX document view:
-  - Each field shows the current value.
-  - If a suggestion is ready and not yet resolved, the suggested value is shown directly below in a distinct style with **Apply** and **Reject** buttons for that field.
-  - Fields: Title, Correspondent, Document type, Tags (as badges; new suggested tags show confidence and a "Create & apply" toggle).
-  - Applied fields show a ✓; rejected fields show a strikethrough and no longer display their Apply/Reject buttons.
-  - **Apply all remaining** button at the top applies all still-undecided suggested fields in one action.
-  - **Reject all remaining** button rejects all still-undecided fields.
-  - A collapsible **"Model reasoning"** section shows the `reasoning` field for transparency. Collapsed by default.
-  - Detected language shown as a small label (e.g. `🌐 Dutch`).
-  - Closing the pane returns to the full table; field states are preserved in client-side memory for the duration of the session (lost on page refresh).
-- Approval state (which fields are applied/rejected) is shared between the table and the review pane.
+#### Keyboard shortcuts (pane only)
 
-#### Approval and apply workflow
+| Key | Action |
+|---|---|
+| `A` | Apply all remaining & go to next |
+| `R` | Reject all remaining & go to next |
+| `→` / `L` | Next document |
+| `←` / `H` | Previous document |
+| `Esc` | Close pane |
 
-- Each document with a ready suggestion has an **approve checkbox** — visible in the table (when "Show suggestions" is on) and in the review pane. Approval state is shared between both views.
-- **"Apply all approved"** button: disabled until at least one document is approved; applies all approved documents in a single `POST /api/apply` call. On success, approved rows update to `suggestion_status = "applied"` (🔵) and the button resets.
-- **Per-field apply** (from table or pane): sends a `POST /api/apply` with only the relevant field set; the other field is `null`.
+Shortcuts are inactive when focus is in an input or textarea.
 
-#### Loading states
+#### Help overlay
 
-- **Paperless calls** (< 2 s): the triggering button is disabled and shows a spinner label (e.g. "Refreshing…"). A new request to the same endpoint is blocked until the previous one completes.
-- **Ollama queue** (10–30 s per document): the "Generate suggestions" button is disabled while the queue is non-empty. A progress bar and "Processing N of M…" label update as each document completes. The "Show suggestions" badge count updates in real time as results arrive.
-- **Apply**: the "Apply all approved" button is disabled while the apply request is in flight.
+A **?** button in the header opens a full help modal documenting the workflow, columns, review pane, and keyboard shortcuts.
 
-#### Error handling
+### 8.2 Task queue architecture
 
-- Failed page load: inline error message in the table body.
-- Failed suggestion (single document): that row's status shows an error indicator; other rows are unaffected.
-- Failed apply (single document): inline error shown below the table; successfully applied documents are still updated.
+#### Paperless-NGX requests (fast)
 
-### 8.2 Request handling and task queue architecture
-
-Different external calls have very different latency profiles and must be handled accordingly.
-
-#### Paperless-NGX requests (fast, < 2 s expected)
-
-- Triggered directly in response to user actions (page load, refresh, apply).
-- Concurrent requests to the same endpoint are blocked — a new request cannot start until the previous one resolves.
-- UI buttons are disabled for the duration; a spinner label indicates activity.
-- Errors surface immediately as inline messages.
+Triggered by user actions; buttons disabled while in flight.
 
 #### Ollama requests (slow, 10–30 s per document)
 
-Ollama can only process one document at a time (single GPU, serial inference). Sending multiple requests concurrently would queue them inside Ollama anyway, with no benefit. The architecture therefore uses an explicit **backend task queue**:
+Uses a **single global background job** (`_global_job`) with an `asyncio.Queue` worker:
 
-**Backend (FastAPI)**
-- `POST /api/suggestions` no longer blocks until all documents are processed. Instead it enqueues the requested document IDs and returns immediately with a `job_id`.
-- A background worker (Python `asyncio` task) pulls one document ID at a time from the queue, calls Ollama, and stores the result.
-- Two new endpoints expose queue state:
-  - `GET /api/suggestions/status?job_id=<id>` — returns `{ total, completed, results: [...] }` where `results` grows as documents finish.
-  - `DELETE /api/suggestions/queue` — cancels all pending items (does not interrupt the in-flight Ollama call).
-
-**Frontend**
-- After POSTing to `/api/suggestions`, the frontend polls `GET /api/suggestions/status` every 2 seconds.
-- Each completed result is rendered as a suggestion card immediately (progressive rendering).
-- The progress indicator shows `"Processing N of M…"` and updates with each poll.
-- Polling stops when `completed == total` or the user navigates away.
-- The "Generate suggestions" button is disabled while `completed < total`.
-
-#### Apply requests (fast, one PATCH per document)
-
-- Sent as a single `POST /api/apply` with all approved entries.
-- The apply button is disabled until at least one card is approved and while the request is in flight.
-- Errors are shown inline; the document list is refreshed on success.
-
-#### Graceful shutdown
-
-When the container receives SIGTERM (e.g. `docker compose stop`):
-1. The pending queue is cleared immediately — no new Ollama calls are started.
-2. The in-flight Ollama HTTP request is cancelled via httpx task cancellation. Ollama stops receiving the connection and halts generation.
-3. FastAPI completes the shutdown sequence.
-
-The Docker Compose `stop_grace_period` must be set to at least the Ollama timeout (60 s) to allow this to complete cleanly before Docker sends SIGKILL. The default 10 s is not sufficient.
-
----
+- `POST /api/suggestions` adds new document IDs to the existing job (deduplicating). Multiple calls accumulate into one job — no new job_id is issued.
+- The frontend always polls `GET /api/suggestions/status` (no job_id parameter).
+- The queue detail panel shows per-item status and timing.
+- `DELETE /api/suggestions/queue` drains the queue and resets the global job to `null`.
+- On page load, the frontend probes `/api/suggestions/status` and auto-reconnects if a job is in progress.
+- `"pending"` and `"ready"` statuses are transient in-memory — lost on server restart.
 
 ### 8.3 Settings page (`/settings`)
 
-**Layout**
-- Header with page title and Back link.
-- Form grouped into two sections:
-  - **Paperless-NGX connection**: base URL, API token
-  - **Suggestion provider**: provider selector, Ollama base URL, Ollama model, temperature, confidence discount, few-shot minimum documents count
-- Save button, status line below.
-
-**Behaviour**
-- On load: fetches current settings and populates form fields. Token shown as `***`.
-- On submit: POSTs form values; token only updated if value differs from `***`; shows "Settings saved." or error.
+Form with two sections: Paperless-NGX connection and suggestion provider config. Token shown as `***`; only updated on submit if changed.
 
 ---
 
@@ -605,76 +441,67 @@ The Docker Compose `stop_grace_period` must be set to at least the Ollama timeou
 
 ### 9.1 Paperless-NGX
 
-- **Auth**: `Authorization: Token <paperless_token>` header. Omitted if token is empty.
-- **Pagination**: follows `next` URL in paginated responses until exhausted.
+- **Auth**: `Authorization: Token <paperless_token>` header; omitted if token is empty.
+- **Redirects**: `follow_redirects=True` on all httpx clients (Paperless may redirect HTTP→HTTPS).
+- **Pagination**: follows `next` URL until exhausted.
 - **Endpoints used**:
-  - `GET /api/documents/` — fetch all documents (includes `content`, `correspondent`, `document_type`, `created` fields)
-  - `GET /api/tags/` — fetch all tags
-  - `GET /api/correspondents/` — fetch all correspondents (to resolve IDs → names)
-  - `GET /api/document_types/` — fetch all document types (to resolve IDs → names)
-  - `POST /api/tags/` — create a new tag
-  - `GET /api/custom_fields/` — fetch all custom fields to resolve the "Metadata reviewed" field ID (case-insensitive name match; if a field with that name exists but has the wrong data type, a new field named "Metadata reviewed (cleaner)" is created instead)
-  - `POST /api/custom_fields/` — create the "Metadata reviewed" date field if it does not exist
-  - `PATCH /api/documents/{id}/` — update a document (includes custom field value)
-  - `GET /api/documents/{id}/thumb/` — proxied for thumbnail display (see §4.10)
-  - `GET /api/documents/{id}/preview/` — proxied for PDF preview (see §4.11)
+  - `GET /api/documents/` — all documents (includes `content`, `correspondent`, `document_type`, `created`, `custom_fields`)
+  - `GET /api/tags/` — all tags (includes `matching_algorithm` for manual/auto detection)
+  - `GET /api/correspondents/` — resolve IDs → names
+  - `GET /api/document_types/` — resolve IDs → names
+  - `GET /api/custom_fields/` — resolve / create the three custom fields
+  - `POST /api/custom_fields/` — create missing custom fields
+  - `POST /api/tags/` — create new tags
+  - `PATCH /api/documents/{id}/` — update document
+  - `GET /api/documents/{id}/thumb/` — thumbnail proxy
+  - `GET /api/documents/{id}/preview/` — PDF proxy
 
 ### 9.2 Ollama
 
-- **Client**: Instructor library (`instructor` + `ollama` Python packages) rather than raw `httpx`. Instructor enforces the response schema and retries on malformed output.
-- **Endpoint**: `POST /api/chat` (Instructor uses the chat endpoint).
-- **Temperature**: `ollama_temperature` setting (default `0.0`) for deterministic output.
+- **Client**: `instructor.from_openai(AsyncOpenAI(base_url=f"{ollama_url}/v1", api_key="ollama"))`
+- **Temperature**: `ollama_temperature` setting (default `0.0`).
 - **Timeout**: 60 seconds per document.
+- **`/no_think` prefix**: suppresses extended reasoning mode in qwen3 models.
 
 ### 9.3 Language detection
 
-- **Library**: `langdetect` (Python package, no model call required).
-- Run on the first 500 characters of `content` from the Paperless document object.
-- Returns a language name string (e.g. `"Dutch"`, `"German"`, `"English"`).
-- If detection raises an exception or returns low-confidence result, passes `"unknown"` to the prompt.
+- **Library**: `langdetect` (Python, no model call).
+- Runs on first 500 characters of `content`.
+- Returns language name string or `"unknown"` on failure.
 
 ---
 
 ## 10. Deployment
 
 - Docker image based on `python:3.12-slim`.
-- Single `paperless-cleaner` service, port `8080`.
-- Additional Python dependencies: `instructor`, `langdetect`.
-- `app/settings.json` bind-mounted from host for persistence. **Must be created (`touch app/settings.json`) before first `docker compose up`.**
-- `llm_quality` scores and `suggestion_status` are persisted in `settings.json` keyed by document ID so they survive restarts. Structure:
-  ```json
-  {
-    "paperless_base_url": "...",
-    "paperless_token": "...",
-    "ollama_base_url": "...",
-    "ollama_model": "...",
-    "suggestion_provider": "...",
-    "document_state": {
-      "123": { "llm_quality": 45, "suggestion_status": "done" },
-      "124": { "llm_quality": null, "suggestion_status": "ready" }
-    }
-  }
-  ```
-- Field-level apply/reject state (which fields are applied or rejected per document) is **not** persisted — it is held in client-side memory only and is lost on page refresh. Only the final `suggestion_status` transition to `"done"` is persisted.
-- `stop_grace_period: 70s` — allows the in-flight Ollama request (60 s timeout) to be cancelled cleanly before Docker sends SIGKILL.
-- Auto-restart unless stopped.
+- Host port `8200`, container port `8080`.
+- `app/settings.json` bind-mounted from host. Must be created (`touch app/settings.json`) before first `docker compose up`.
+- `stop_grace_period: 70s` — allows in-flight Ollama requests (60 s timeout) to be cancelled before Docker sends SIGKILL.
+- `restart: unless-stopped`.
+
+**What persists across restarts:**
+- Settings (`app/settings.json`)
+- LLM quality scores, suggestion status `"done"`, and review dates (Paperless custom fields)
+
+**What does not persist:**
+- `"pending"` and `"ready"` suggestion statuses (transient in-memory)
+- Per-field apply/reject state (client-side memory only; lost on page refresh)
+- The global suggestion queue (lost on restart; queue must be re-submitted)
 
 ---
 
 ## 11. Resolved decisions
 
-1. **Task queue persistence** — losing queued jobs on container restart is acceptable. Graceful shutdown ensures Ollama stops promptly (see §8.2).
-2. **Paperless-NGX token security** — token masked in `GET /api/settings`; plaintext storage accepted; network-level restriction is the user's responsibility.
-3. **Filtering** — promoted to core feature (see §8.1).
-4. **Loading states** — resolved via loading states spec and task queue architecture (see §8.1, §8.2).
-5. **Batch Ollama calls** — resolved via serial task queue with progressive frontend rendering (see §8.2).
+1. **State storage** — document state (quality, status, review date) stored in Paperless-NGX custom fields rather than a local database. State is visible inside Paperless and survives tool reinstallation.
+2. **Tag protection** — tags with `matching_algorithm = 0` (manual/workflow tags) are never suggested for removal. They are listed in the prompt as "protected" and excluded from the diff UI.
+3. **Single global queue** — multiple "Generate suggestions" clicks add to the same job rather than creating separate jobs. Deduplication prevents the same document being queued twice.
+4. **No-op suppression** — correspondent and document type suggestions that match the current value are discarded server-side before returning to the UI.
+5. **Paperless token security** — token masked in `GET /api/settings`; plaintext storage in `settings.json` accepted; network-level restriction is the user's responsibility.
 
 ---
 
 ## 12. Future nice-to-haves
 
-These are out of scope for the current implementation but worth revisiting later.
-
-1. **App-level authentication**: a password configured in settings that gates access to the entire UI. Useful if the app is reachable beyond a trusted local network.
-2. **Select all filtered**: a checkbox to select all currently visible (filtered) rows at once for bulk suggestion generation.
-3. **Task queue persistence**: survive container restarts without losing queued suggestion jobs.
+1. **App-level authentication** — password gating access to the UI.
+2. **Queue persistence** — survive server restarts without losing the suggestion queue.
+3. **Bulk tag editing** — apply tag changes across multiple documents simultaneously.

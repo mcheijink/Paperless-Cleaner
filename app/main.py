@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
-import uuid
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import httpx
 import instructor
@@ -94,12 +97,6 @@ _BUILTIN_EXAMPLES = [
 # Data models
 # ---------------------------------------------------------------------------
 
-class DocumentState(BaseModel):
-    llm_quality: int | None = None
-    suggestion_status: str = "none"
-    fallback_used: bool = False
-
-
 class AppSettings(BaseModel):
     paperless_base_url: str = "http://paperless-ngx:8000"
     paperless_token: str = ""
@@ -109,7 +106,6 @@ class AppSettings(BaseModel):
     ollama_temperature: float = 0.0
     confidence_discount: float = 0.2
     few_shot_min_documents: int = 5
-    document_state: dict[str, DocumentState] = Field(default_factory=dict)
 
 
 class SuggestRequest(BaseModel):
@@ -136,6 +132,7 @@ class Suggestion(BaseModel):
     suggested_correspondent: SuggestedField | None = None
     suggested_document_type: SuggestedField | None = None
     suggested_tags: list[SuggestedTag] = Field(default_factory=list)
+    protected_tags: list[str] = Field(default_factory=list)  # manual tags — never shown as removals
     reason: str
     fallback_used: bool = False
 
@@ -189,9 +186,19 @@ class _OllamaResponse(BaseModel):
 # Job state
 # ---------------------------------------------------------------------------
 
+class JobItem(BaseModel):
+    doc_id: int
+    title: str
+    status: str = "pending"   # "pending" | "processing" | "done" | "failed"
+    started_at: float | None = None
+    finished_at: float | None = None
+
+
 class JobState(BaseModel):
     total: int
     completed: int = 0
+    started_at: float = Field(default_factory=time.time)
+    items: list[JobItem] = Field(default_factory=list)
     results: list[Suggestion] = Field(default_factory=list)
 
 
@@ -204,9 +211,18 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 _suggestion_queue: asyncio.Queue = asyncio.Queue()
-_jobs: dict[str, JobState] = {}
+_global_job: JobState | None = None
 _worker_task: asyncio.Task | None = None
 _current_ollama_task: asyncio.Task | None = None
+
+# In-memory transient state (lost on restart — intentional)
+_transient_status: dict[str, str] = {}    # doc_id_str → "pending" | "ready"
+_transient_fallback: dict[str, bool] = {} # doc_id_str → fallback_used
+
+# Custom field ID cache (populated at startup)
+_cf_metadata_reviewed_id: int | None = None
+_cf_llm_quality_id: int | None = None
+_cf_suggestion_status_id: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -214,16 +230,10 @@ _current_ollama_task: asyncio.Task | None = None
 # ---------------------------------------------------------------------------
 
 def load_settings() -> AppSettings:
-    if SETTINGS_FILE.exists():
+    if SETTINGS_FILE.exists() and SETTINGS_FILE.stat().st_size > 0:
         raw = json.loads(SETTINGS_FILE.read_text())
-        # Deserialise document_state sub-dict
-        doc_state_raw = raw.pop("document_state", {})
-        settings = AppSettings(**raw)
-        settings.document_state = {
-            k: DocumentState(**v) if isinstance(v, dict) else v
-            for k, v in doc_state_raw.items()
-        }
-        return settings
+        raw.pop("document_state", None)  # remove legacy field if present
+        return AppSettings(**{k: v for k, v in raw.items() if k in AppSettings.model_fields})
     settings = AppSettings(
         paperless_base_url=os.getenv("PAPERLESS_BASE_URL", "http://paperless-ngx:8000"),
         paperless_token=os.getenv("PAPERLESS_TOKEN", ""),
@@ -236,13 +246,7 @@ def load_settings() -> AppSettings:
 
 
 def save_settings(settings: AppSettings) -> None:
-    data = settings.model_dump()
-    # Serialise document_state properly
-    data["document_state"] = {
-        k: v.model_dump() if isinstance(v, DocumentState) else v
-        for k, v in settings.document_state.items()
-    }
-    SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+    SETTINGS_FILE.write_text(json.dumps(settings.model_dump(), indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -270,22 +274,44 @@ async def _paginated_get(client: httpx.AsyncClient, url: str, headers: dict) -> 
 async def get_documents(settings: AppSettings) -> list[dict[str, Any]]:
     headers = _auth_headers(settings)
     url = f"{settings.paperless_base_url.rstrip('/')}/api/documents/"
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         return await _paginated_get(client, url, headers)
 
 
 async def get_tag_map(settings: AppSettings) -> dict[int, str]:
     headers = _auth_headers(settings)
     url = f"{settings.paperless_base_url.rstrip('/')}/api/tags/"
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         tags = await _paginated_get(client, url, headers)
     return {t["id"]: t["name"] for t in tags}
+
+
+async def get_tag_objects(settings: AppSettings) -> list[dict]:
+    """Returns full tag objects including matching_algorithm."""
+    headers = _auth_headers(settings)
+    url = f"{settings.paperless_base_url.rstrip('/')}/api/tags/"
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        return await _paginated_get(client, url, headers)
+
+
+def split_auto_manual_tags(tag_objects: list[dict]) -> tuple[set[str], set[str]]:
+    """Returns (auto_tag_names, manual_tag_names).
+    Auto tags have matching_algorithm != 0 — Paperless assigns these automatically.
+    Manual tags (algorithm=0) are workflow/status tags managed by the user."""
+    auto_tags: set[str] = set()
+    manual_tags: set[str] = set()
+    for t in tag_objects:
+        if t.get("matching_algorithm", 0) != 0:
+            auto_tags.add(t["name"])
+        else:
+            manual_tags.add(t["name"])
+    return auto_tags, manual_tags
 
 
 async def get_correspondent_map(settings: AppSettings) -> dict[int, str]:
     headers = _auth_headers(settings)
     url = f"{settings.paperless_base_url.rstrip('/')}/api/correspondents/"
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         items = await _paginated_get(client, url, headers)
     return {c["id"]: c["name"] for c in items}
 
@@ -293,36 +319,46 @@ async def get_correspondent_map(settings: AppSettings) -> dict[int, str]:
 async def get_document_type_map(settings: AppSettings) -> dict[int, str]:
     headers = _auth_headers(settings)
     url = f"{settings.paperless_base_url.rstrip('/')}/api/document_types/"
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         items = await _paginated_get(client, url, headers)
     return {d["id"]: d["name"] for d in items}
 
 
-async def get_or_create_custom_field(settings: AppSettings, client: httpx.AsyncClient) -> int:
-    headers = {**_auth_headers(settings), "Content-Type": "application/json"}
-    url = f"{settings.paperless_base_url.rstrip('/')}/api/custom_fields/"
-    fields = await _paginated_get(client, url, _auth_headers(settings))
-
-    target_name = "Metadata reviewed"
+async def _resolve_or_create_field(
+    client: httpx.AsyncClient, url: str, headers: dict,
+    fields: list[dict], name: str, data_type: str
+) -> int:
+    """Find a custom field by name+type, or create it. Falls back to name+(cleaner) if wrong type."""
+    target = name
     for f in fields:
-        if f["name"].lower() == target_name.lower():
-            if f.get("data_type") == "date":
+        if f["name"].lower() == target.lower():
+            if f.get("data_type") == data_type:
                 return f["id"]
-            # Wrong type — use fallback name
-            target_name = "Metadata reviewed (cleaner)"
+            target = f"{name} (cleaner)"
             break
-
-    # Check fallback name too
     for f in fields:
-        if f["name"].lower() == target_name.lower():
-            if f.get("data_type") == "date":
-                return f["id"]
-
-    # Create it
-    resp = await client.post(url, headers=headers, json={"name": target_name, "data_type": "date"})
+        if f["name"].lower() == target.lower() and f.get("data_type") == data_type:
+            return f["id"]
+    resp = await client.post(url, headers=headers, json={"name": target, "data_type": data_type})
     if resp.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Failed to create custom field: {resp.text}")
+        raise HTTPException(status_code=502, detail=f"Failed to create custom field '{target}': {resp.text}")
     return resp.json()["id"]
+
+
+async def init_custom_fields(settings: AppSettings) -> None:
+    """Resolve or create all three custom fields and cache their IDs."""
+    global _cf_metadata_reviewed_id, _cf_llm_quality_id, _cf_suggestion_status_id
+    headers_auth = _auth_headers(settings)
+    headers_json = {**headers_auth, "Content-Type": "application/json"}
+    url = f"{settings.paperless_base_url.rstrip('/')}/api/custom_fields/"
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        fields = await _paginated_get(client, url, headers_auth)
+        _cf_metadata_reviewed_id = await _resolve_or_create_field(
+            client, url, headers_json, fields, "Metadata reviewed", "date")
+        _cf_llm_quality_id = await _resolve_or_create_field(
+            client, url, headers_json, fields, "LLM quality", "integer")
+        _cf_suggestion_status_id = await _resolve_or_create_field(
+            client, url, headers_json, fields, "Suggestion status", "string")
 
 
 async def create_tag(settings: AppSettings, client: httpx.AsyncClient, name: str) -> int:
@@ -428,11 +464,13 @@ def heuristic_suggestion(entry: dict[str, Any], tag_names: list[str]) -> Suggest
 def _build_few_shot_section(settings: AppSettings, docs_by_id: dict[int, dict],
                              tag_map: dict[int, str], corr_map: dict[int, str],
                              dtype_map: dict[int, str]) -> str:
-    done_ids = [
-        int(doc_id)
-        for doc_id, state in settings.document_state.items()
-        if state.suggestion_status == "done" and not state.fallback_used
-    ]
+    # Find docs marked "done" via the Paperless custom field
+    done_ids = []
+    if _cf_suggestion_status_id is not None:
+        for doc in docs_by_id.values():
+            cf_values = {cf["field"]: cf["value"] for cf in doc.get("custom_fields", [])}
+            if cf_values.get(_cf_suggestion_status_id) == "done":
+                done_ids.append(doc["id"])
 
     examples_used: list[dict] = []
     if len(done_ids) >= settings.few_shot_min_documents:
@@ -479,7 +517,8 @@ async def ollama_suggestion(
     settings: AppSettings,
     entry: dict[str, Any],
     tag_names: list[str],
-    all_tags: list[str],
+    auto_tag_names: set[str],
+    manual_tag_names: set[str],
     corr_names: list[str],
     dtype_names: list[str],
     docs_by_id: dict[int, dict],
@@ -496,9 +535,19 @@ async def ollama_suggestion(
     current_dtype = dtype_map.get(dtype_id, "unknown") if dtype_id else "unknown"
     doc_date = entry.get("created") or "unknown"
 
+    # Split current tags into auto (LLM can touch) and manual (protected)
+    current_auto_tags = [t for t in tag_names if t in auto_tag_names]
+    current_manual_tags = [t for t in tag_names if t not in auto_tag_names]
+
     few_shot = _build_few_shot_section(settings, docs_by_id, tag_map, corr_map, dtype_map)
 
-    system_prompt = f"""## Output format
+    manual_note = ""
+    if current_manual_tags:
+        manual_note = f"\nProtected tags (do NOT include these — they are managed by the user's workflow): {', '.join(current_manual_tags)}"
+
+    system_prompt = f"""/no_think
+
+## Output format
 Respond with a single valid JSON object. No text outside the JSON.
 
 ## JSON schema
@@ -513,7 +562,7 @@ Respond with a single valid JSON object. No text outside the JSON.
 }}
 
 ## Allowed values
-Tags (select from this list only): {", ".join(all_tags) or "none"}
+Auto-matched tags — only suggest from this list: {", ".join(sorted(auto_tag_names)) or "none"}
 Correspondents (select from this list only): {", ".join(corr_names) or "none"}
 Document types (select from this list only): {", ".join(dtype_names) or "none"}
 
@@ -522,14 +571,22 @@ Document types (select from this list only): {", ".join(dtype_names) or "none"}
 
 ## Rules
 - Title must be sentence case (first word capitalised, rest lowercase) in {language}
-- Title must be 3-6 words
-- Title must describe the subject only — do not include the correspondent, document type, date, or reference numbers; these are stored separately
-- Only suggest a correspondent, document type, or tag if it is in the lists above
+- Title must be 4-7 words — be specific, not generic
+- Title must describe the SPECIFIC subject: what is this document actually about?
+  - For medical invoices: name the specialist type AND whether it was a treatment, checkup/kontrolle, or procedure — and the patient if determinable (e.g. "Kinderarzt kontrolle Jacyntha", "Zahnarzt behandlung Marco", "Augenarzt untersuchung 2026")
+  - For insurance: name the specific policy or vehicle/asset covered
+  - For salary/payroll: name the month or period
+  - Avoid generic words like "Rechnung", "Brief", "Invoice" alone — the document type field already captures that
+- Title must not include the correspondent, document type, date, or reference numbers — these are stored separately
+- Only suggest a correspondent, document type, or tag if it is in the allowed lists above
+- suggested_tags must be the COMPLETE recommended set of auto-matched tags for this document (existing auto tags you want to keep + any new ones to add)
+- Only omit an existing auto tag from suggested_tags if you are very confident (≥ 0.9) it does not apply
 - Set suggested_correspondent and suggested_document_type to null if the current value is already appropriate or you are not confident
 - Confidence is 0.0-1.0; be conservative
-- Do not invent new tags, correspondents, or document types
+- Do not invent new tags, correspondents, or document types{manual_note}
 
 ## Do not
+- Include protected/workflow tags in suggested_tags
 - Include markdown, commentary, or any text outside the JSON
 - Add fields not in the schema
 - Translate the title; keep it in {language}"""
@@ -538,16 +595,15 @@ Document types (select from this list only): {", ".join(dtype_names) or "none"}
 Correspondent: {current_corr}
 Document type: {current_dtype}
 Date: {doc_date}
-Tags: {", ".join(tag_names) or "none"}
+Current auto-matched tags: {", ".join(current_auto_tags) or "none"}
+Protected workflow tags (do not touch): {", ".join(current_manual_tags) or "none"}
 Content (first 500 chars): {content[:500]}"""
 
-    if _ollama_client is None:
-        raise RuntimeError("ollama package not installed")
+    from openai import AsyncOpenAI
 
-    client = instructor.from_ollama(
-        _ollama_client.AsyncClient(host=settings.ollama_base_url),
-        mode=instructor.Mode.JSON,
-    )
+    base = settings.ollama_base_url.rstrip("/")
+    openai_client = AsyncOpenAI(base_url=f"{base}/v1", api_key="ollama")
+    client = instructor.from_openai(openai_client, mode=instructor.Mode.JSON)
 
     response: _OllamaResponse = await asyncio.wait_for(
         client.chat.completions.create(
@@ -557,7 +613,7 @@ Content (first 500 chars): {content[:500]}"""
                 {"role": "user", "content": user_message},
             ],
             response_model=_OllamaResponse,
-            options={"temperature": settings.ollama_temperature},
+            temperature=settings.ollama_temperature,
         ),
         timeout=60.0,
     )
@@ -565,7 +621,7 @@ Content (first 500 chars): {content[:500]}"""
     disc = settings.confidence_discount
 
     # Validate and build SuggestedTag list
-    tag_map_lower = {v.lower(): v for v in all_tags}
+    tag_map_lower = {v.lower(): v for v in auto_tag_names}
     suggested_tags: list[SuggestedTag] = []
     for t in response.suggested_tags:
         name_lower = t.name.lower()
@@ -582,23 +638,23 @@ Content (first 500 chars): {content[:500]}"""
                 is_new=True,
             ))
 
-    # Validate correspondent
+    # Validate correspondent — discard if same as current value
     corr_map_lower = {v.lower(): v for v in corr_names}
     validated_corr: SuggestedField | None = None
     if response.suggested_correspondent:
         n = response.suggested_correspondent.name.lower()
-        if n in corr_map_lower:
+        if n in corr_map_lower and n != current_corr.lower():
             validated_corr = SuggestedField(
                 name=corr_map_lower[n],
                 confidence=max(0.0, response.suggested_correspondent.confidence - disc),
             )
 
-    # Validate document type
+    # Validate document type — discard if same as current value
     dtype_map_lower = {v.lower(): v for v in dtype_names}
     validated_dtype: SuggestedField | None = None
     if response.suggested_document_type:
         n = response.suggested_document_type.name.lower()
-        if n in dtype_map_lower:
+        if n in dtype_map_lower and n != current_dtype.lower():
             validated_dtype = SuggestedField(
                 name=dtype_map_lower[n],
                 confidence=max(0.0, response.suggested_document_type.confidence - disc),
@@ -607,7 +663,7 @@ Content (first 500 chars): {content[:500]}"""
     # Validate title word count
     title = response.suggested_title
     word_count = len(title.strip().split())
-    if not (1 <= word_count <= 10):
+    if not (2 <= word_count <= 10):
         title = entry.get("title", "Untitled")
 
     return Suggestion(
@@ -619,6 +675,7 @@ Content (first 500 chars): {content[:500]}"""
         suggested_correspondent=validated_corr,
         suggested_document_type=validated_dtype,
         suggested_tags=suggested_tags,
+        protected_tags=current_manual_tags,
         reason=response.reason or "Suggested by Ollama model.",
     )
 
@@ -631,9 +688,9 @@ async def _process_one(item: dict[str, Any]) -> None:
     global _current_ollama_task
     settings = item["settings"]
     entry = item["entry"]
-    job_id = item["job_id"]
     tag_names = item["tag_names"]
-    all_tags = item["all_tags"]
+    auto_tag_names = item["auto_tag_names"]
+    manual_tag_names = item["manual_tag_names"]
     corr_names = item["corr_names"]
     dtype_names = item["dtype_names"]
     docs_by_id = item["docs_by_id"]
@@ -641,12 +698,19 @@ async def _process_one(item: dict[str, Any]) -> None:
     corr_map = item["corr_map"]
     dtype_map = item["dtype_map"]
 
+    # Mark item as processing
+    job = _global_job
+    job_item = next((i for i in job.items if i.doc_id == entry["id"]), None) if job else None
+    if job_item:
+        job_item.status = "processing"
+        job_item.started_at = time.time()
+
     fallback_used = False
     try:
         if settings.suggestion_provider == "ollama":
             coro = ollama_suggestion(
-                settings, entry, tag_names, all_tags, corr_names, dtype_names,
-                docs_by_id, tag_map, corr_map, dtype_map,
+                settings, entry, tag_names, auto_tag_names, manual_tag_names,
+                corr_names, dtype_names, docs_by_id, tag_map, corr_map, dtype_map,
             )
             _current_ollama_task = asyncio.current_task()
             suggestion = await coro
@@ -654,22 +718,32 @@ async def _process_one(item: dict[str, Any]) -> None:
         else:
             suggestion = heuristic_suggestion(entry, tag_names)
     except Exception:
+        logger.exception("Ollama suggestion failed for doc %s, falling back to heuristic", entry.get("id"))
         suggestion = heuristic_suggestion(entry, tag_names)
         suggestion.fallback_used = True
         fallback_used = True
 
-    # Persist llm_quality + status
-    settings_fresh = load_settings()
     doc_id_str = str(entry["id"])
-    existing = settings_fresh.document_state.get(doc_id_str, DocumentState())
-    existing.suggestion_status = "ready"
-    existing.fallback_used = fallback_used
-    if suggestion.title_quality is not None:
-        existing.llm_quality = suggestion.title_quality
-    settings_fresh.document_state[doc_id_str] = existing
-    save_settings(settings_fresh)
+    _transient_status[doc_id_str] = "ready"
+    _transient_fallback[doc_id_str] = fallback_used
 
-    job = _jobs.get(job_id)
+    if job_item:
+        job_item.status = "failed" if fallback_used else "done"
+        job_item.finished_at = time.time()
+
+    # Persist llm_quality to Paperless if available
+    if suggestion.title_quality is not None and _cf_llm_quality_id is not None:
+        try:
+            settings_fresh = load_settings()
+            patch_url = f"{settings_fresh.paperless_base_url.rstrip('/')}/api/documents/{entry['id']}/"
+            headers = {**_auth_headers(settings_fresh), "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                await client.patch(patch_url, headers=headers, json={
+                    "custom_fields": [{"field": _cf_llm_quality_id, "value": suggestion.title_quality}]
+                })
+        except Exception:
+            logger.exception("Failed to persist llm_quality for doc %s", entry["id"])
+
     if job:
         job.results.append(suggestion)
         job.completed += 1
@@ -693,6 +767,11 @@ async def _worker() -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     global _worker_task
+    settings = load_settings()
+    try:
+        await init_custom_fields(settings)
+    except Exception:
+        logger.exception("Failed to initialise Paperless custom fields — will retry on first use")
     _worker_task = asyncio.create_task(_worker())
 
 
@@ -731,7 +810,7 @@ async def settings_page(request: Request) -> HTMLResponse:
 @app.get("/api/settings")
 async def get_settings() -> dict[str, Any]:
     s = load_settings()
-    d = s.model_dump(exclude={"document_state"})
+    d = s.model_dump()
     d["paperless_token"] = "***" if s.paperless_token else ""
     return d
 
@@ -743,8 +822,12 @@ async def update_settings(payload: SettingsRequest) -> dict[str, Any]:
     if data.get("paperless_token") == "***":
         data["paperless_token"] = current.paperless_token
     new_settings = AppSettings(**data)
-    new_settings.document_state = current.document_state
     save_settings(new_settings)
+    # Re-initialise custom fields in case the Paperless URL changed
+    try:
+        await init_custom_fields(new_settings)
+    except Exception:
+        logger.exception("Failed to re-initialise custom fields after settings update")
     return {"status": "ok"}
 
 
@@ -767,9 +850,25 @@ async def entries(sort_by: str = Query("name", pattern="^(name|tags|quality)$"))
         document_type = dtype_map.get(dtype_id) if dtype_id else None
         doc_date = d.get("created")
         title = d.get("title", "")
-
         doc_id_str = str(d["id"])
-        state = settings.document_state.get(doc_id_str, DocumentState())
+
+        # Read persistent state from Paperless custom fields
+        cf_values: dict[int, Any] = {
+            cf["field"]: cf["value"]
+            for cf in d.get("custom_fields", [])
+        }
+        llm_quality: int | None = cf_values.get(_cf_llm_quality_id) if _cf_llm_quality_id else None
+        suggestion_status_persisted: str = cf_values.get(_cf_suggestion_status_id, "") or ""
+        metadata_reviewed: str | None = cf_values.get(_cf_metadata_reviewed_id) if _cf_metadata_reviewed_id else None
+
+        # Overlay with transient in-memory state (pending/ready)
+        transient = _transient_status.get(doc_id_str)
+        if transient:
+            suggestion_status = transient
+        elif suggestion_status_persisted == "done":
+            suggestion_status = "done"
+        else:
+            suggestion_status = "none"
 
         enriched.append({
             "id": d["id"],
@@ -779,11 +878,11 @@ async def entries(sort_by: str = Query("name", pattern="^(name|tags|quality)$"))
             "date": doc_date,
             "tags": tag_names,
             "heuristic_quality": score_heuristic(title, tag_names),
-            "llm_quality": state.llm_quality,
+            "llm_quality": llm_quality,
             "metadata_completeness": score_completeness(title, tag_names, correspondent, document_type, doc_date),
-            "suggestion_status": state.suggestion_status,
-            "fallback_used": state.fallback_used,
-            "metadata_reviewed": None,  # populated via custom field if desired
+            "suggestion_status": suggestion_status,
+            "fallback_used": _transient_fallback.get(doc_id_str, False),
+            "metadata_reviewed": metadata_reviewed,
         })
 
     if sort_by == "name":
@@ -800,30 +899,44 @@ async def entries(sort_by: str = Query("name", pattern="^(name|tags|quality)$"))
 
 @app.post("/api/suggestions")
 async def suggestions(payload: SuggestRequest) -> dict[str, Any]:
+    global _global_job
     settings = load_settings()
-    tag_map, corr_map, dtype_map, docs = await asyncio.gather(
-        get_tag_map(settings),
+    tag_objects, corr_map, dtype_map, docs = await asyncio.gather(
+        get_tag_objects(settings),
         get_correspondent_map(settings),
         get_document_type_map(settings),
         get_documents(settings),
     )
+    tag_map = {t["id"]: t["name"] for t in tag_objects}
+    auto_tag_names, manual_tag_names = split_auto_manual_tags(tag_objects)
     docs_by_id = {doc["id"]: doc for doc in docs}
-    all_tags = sorted(tag_map.values())
     corr_names = sorted(corr_map.values())
     dtype_names = sorted(dtype_map.values())
 
-    job_id = str(uuid.uuid4())
-    valid_ids = [doc_id for doc_id in payload.ids if doc_id in docs_by_id]
-    _jobs[job_id] = JobState(total=len(valid_ids))
+    # Deduplicate: skip ids already in the global job queue
+    existing_ids: set[int] = set()
+    if _global_job is not None:
+        existing_ids = {i.doc_id for i in _global_job.items}
 
-    # Mark all as pending
-    settings_fresh = load_settings()
+    valid_ids = [
+        doc_id for doc_id in payload.ids
+        if doc_id in docs_by_id and doc_id not in existing_ids
+    ]
+    new_items = [
+        JobItem(doc_id=doc_id, title=docs_by_id[doc_id].get("title", str(doc_id)))
+        for doc_id in valid_ids
+    ]
+
+    if _global_job is None:
+        _global_job = JobState(total=len(valid_ids), items=new_items)
+    else:
+        _global_job.items.extend(new_items)
+        _global_job.total += len(valid_ids)
+
+    # Mark all new items as pending in transient state
     for doc_id in valid_ids:
-        doc_id_str = str(doc_id)
-        state = settings_fresh.document_state.get(doc_id_str, DocumentState())
-        state.suggestion_status = "pending"
-        settings_fresh.document_state[doc_id_str] = state
-    save_settings(settings_fresh)
+        _transient_status[str(doc_id)] = "pending"
+        _transient_fallback.pop(str(doc_id), None)
 
     for doc_id in valid_ids:
         entry = docs_by_id[doc_id]
@@ -831,9 +944,9 @@ async def suggestions(payload: SuggestRequest) -> dict[str, Any]:
         await _suggestion_queue.put({
             "settings": settings,
             "entry": entry,
-            "job_id": job_id,
             "tag_names": tag_names,
-            "all_tags": all_tags,
+            "auto_tag_names": auto_tag_names,
+            "manual_tag_names": manual_tag_names,
             "corr_names": corr_names,
             "dtype_names": dtype_names,
             "docs_by_id": docs_by_id,
@@ -842,24 +955,37 @@ async def suggestions(payload: SuggestRequest) -> dict[str, Any]:
             "dtype_map": dtype_map,
         })
 
-    return {"job_id": job_id, "total": len(valid_ids)}
+    return {"newly_added": len(valid_ids), "total": _global_job.total}
 
 
 @app.get("/api/suggestions/status")
-async def suggestion_status(job_id: str = Query(...)) -> dict[str, Any]:
-    job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+async def suggestion_status() -> dict[str, Any]:
+    if _global_job is None:
+        raise HTTPException(status_code=404, detail="No active job")
+
+    job = _global_job
+    now = time.time()
+    done_items = [i for i in job.items if i.finished_at is not None]
+    durations = [i.finished_at - i.started_at for i in done_items if i.started_at]
+    avg_seconds = sum(durations) / len(durations) if durations else None
+    elapsed = now - job.started_at
+    remaining = job.total - job.completed
+    eta_seconds = avg_seconds * remaining if avg_seconds is not None else None
+
     return {
-        "job_id": job_id,
         "total": job.total,
         "completed": job.completed,
         "results": [s.model_dump() for s in job.results],
+        "items": [i.model_dump() for i in job.items],
+        "elapsed_seconds": round(elapsed, 1),
+        "avg_seconds_per_doc": round(avg_seconds, 1) if avg_seconds is not None else None,
+        "eta_seconds": round(eta_seconds) if eta_seconds is not None else None,
     }
 
 
 @app.delete("/api/suggestions/queue")
 async def cancel_queue() -> dict[str, Any]:
+    global _global_job
     cancelled = 0
     while not _suggestion_queue.empty():
         try:
@@ -868,6 +994,7 @@ async def cancel_queue() -> dict[str, Any]:
             cancelled += 1
         except asyncio.QueueEmpty:
             break
+    _global_job = None
     return {"status": "ok", "cancelled": cancelled}
 
 
@@ -879,15 +1006,21 @@ async def apply_changes(payload: ApplyRequest) -> dict[str, Any]:
     today = date.today().isoformat()
     tags_created: list[str] = []
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        tag_map = await get_tag_map(settings)
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        tag_objects = await get_tag_objects(settings)
+        tag_map = {t["id"]: t["name"] for t in tag_objects}
+        auto_tag_names, _manual_tag_names = split_auto_manual_tags(tag_objects)
         corr_map = await get_correspondent_map(settings)
         dtype_map = await get_document_type_map(settings)
         inverse_tag_map = {v.lower(): k for k, v in tag_map.items()}
         inverse_corr_map = {v.lower(): k for k, v in corr_map.items()}
         inverse_dtype_map = {v.lower(): k for k, v in dtype_map.items()}
+        # Map tag id → is_manual for preserving workflow tags
+        tag_id_is_manual = {t["id"]: (t.get("matching_algorithm", 0) == 0) for t in tag_objects}
 
-        custom_field_id = await get_or_create_custom_field(settings, client)
+        # Ensure custom fields are initialised (may not be if startup failed)
+        if _cf_metadata_reviewed_id is None:
+            await init_custom_fields(settings)
 
         for entry in payload.entries:
             patch: dict[str, Any] = {}
@@ -906,10 +1039,18 @@ async def apply_changes(payload: ApplyRequest) -> dict[str, Any]:
                     patch["document_type"] = did
 
             if entry.tags is not None:
-                tag_ids: list[int] = []
+                # Fetch current document tags to preserve manual/workflow ones
+                doc_resp = await client.get(
+                    f"{settings.paperless_base_url.rstrip('/')}/api/documents/{entry.id}/",
+                    headers=headers_auth,
+                )
+                current_tag_ids: list[int] = doc_resp.json().get("tags", []) if doc_resp.status_code == 200 else []
+                manual_tag_ids = [tid for tid in current_tag_ids if tag_id_is_manual.get(tid, True)]
+
+                tag_ids: list[int] = list(manual_tag_ids)  # start with preserved manual tags
                 for tag_name in entry.tags:
                     existing_id = inverse_tag_map.get(tag_name.lower())
-                    if existing_id is not None:
+                    if existing_id is not None and existing_id not in tag_ids:
                         tag_ids.append(existing_id)
                 # Create new tags
                 for new_tag in entry.tags_new:
@@ -918,22 +1059,28 @@ async def apply_changes(payload: ApplyRequest) -> dict[str, Any]:
                         tag_ids.append(new_id)
                         inverse_tag_map[new_tag.lower()] = new_id
                         tags_created.append(new_tag)
+                    elif inverse_tag_map[new_tag.lower()] not in tag_ids:
+                        tag_ids.append(inverse_tag_map[new_tag.lower()])
                 patch["tags"] = tag_ids
 
-            patch["custom_fields"] = [{"field": custom_field_id, "value": today}]
+            custom_fields_patch = []
+            if _cf_metadata_reviewed_id is not None:
+                custom_fields_patch.append({"field": _cf_metadata_reviewed_id, "value": today})
+            if _cf_suggestion_status_id is not None:
+                custom_fields_patch.append({"field": _cf_suggestion_status_id, "value": "done"})
+            if custom_fields_patch:
+                patch["custom_fields"] = custom_fields_patch
 
             url = f"{settings.paperless_base_url.rstrip('/')}/api/documents/{entry.id}/"
             resp = await client.patch(url, headers=headers_json, json=patch)
             if resp.status_code >= 400:
                 raise HTTPException(status_code=502, detail=f"Apply failed for {entry.id}: {resp.text}")
 
-            # Update document state
+            # Clear transient state
             doc_id_str = str(entry.id)
-            state = settings.document_state.get(doc_id_str, DocumentState())
-            state.suggestion_status = "done"
-            settings.document_state[doc_id_str] = state
+            _transient_status.pop(doc_id_str, None)
+            _transient_fallback.pop(doc_id_str, None)
 
-    save_settings(settings)
     return {"status": "ok", "updated": len(payload.entries), "tags_created": tags_created}
 
 
@@ -941,7 +1088,7 @@ async def apply_changes(payload: ApplyRequest) -> dict[str, Any]:
 async def proxy_thumb(doc_id: int) -> StreamingResponse:
     settings = load_settings()
     url = f"{settings.paperless_base_url.rstrip('/')}/api/documents/{doc_id}/thumb/"
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         resp = await client.get(url, headers=_auth_headers(settings))
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail="Thumbnail not available")
@@ -952,7 +1099,7 @@ async def proxy_thumb(doc_id: int) -> StreamingResponse:
 async def proxy_preview(doc_id: int) -> StreamingResponse:
     settings = load_settings()
     url = f"{settings.paperless_base_url.rstrip('/')}/api/documents/{doc_id}/preview/"
-    client = httpx.AsyncClient(timeout=60.0)
+    client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
     req = client.build_request("GET", url, headers=_auth_headers(settings))
     resp = await client.send(req, stream=True)
     if resp.status_code >= 400:
