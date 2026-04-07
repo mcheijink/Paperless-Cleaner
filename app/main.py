@@ -377,7 +377,13 @@ async def create_tag(settings: AppSettings, client: httpx.AsyncClient, name: str
 _FILENAME_RE = re.compile(r"(^scan\d+$|^doc_|^IMG_|^[0-9]+$|_.*_)", re.IGNORECASE)
 
 
-def score_heuristic(title: str, tags: list[str]) -> int:
+def score_heuristic(title: str, tags: list[str] = []) -> int:
+    """
+    Score title quality only (0-100). Tags are intentionally excluded —
+    they are already captured by metadata_completeness. Including them here
+    caused well-tagged documents with raw filenames to outscore cleanly
+    titled documents with fewer tags.
+    """
     words = title.strip().split()
     wc = len(words)
 
@@ -386,31 +392,28 @@ def score_heuristic(title: str, tags: list[str]) -> int:
     elif wc == 1:
         pts = 15
     elif wc == 2:
-        pts = 35
-    elif 3 <= wc <= 6:
-        pts = 60
+        pts = 40
+    elif 3 <= wc <= 7:
+        pts = 70
     else:
-        pts = 35
+        pts = 50  # long titles still acceptable
 
-    # Casing
+    # Casing bonus — first word capitalised, rest lower (sentence case)
     if wc > 0:
         first = words[0]
         rest = words[1:]
         if first[0].isupper() and all(w.islower() for w in rest if w.isalpha()):
-            pts += 15
+            pts += 20
         elif any(c.isupper() for c in title):
             pts += 5
 
-    # Tags
-    pts += min(len(tags) * 9, 27)
-
-    # Penalties
+    # Penalties — raw filenames and digit-heavy strings
     t = title.strip()
     if _FILENAME_RE.search(t) or ("_" in t and " " not in t):
-        pts -= 30
+        pts -= 50
     digit_ratio = sum(1 for c in t if c.isdigit()) / max(len(t), 1)
     if digit_ratio > 0.4:
-        pts -= 20
+        pts -= 30
 
     return max(0, min(pts, 100))
 
@@ -877,7 +880,7 @@ async def entries(sort_by: str = Query("name", pattern="^(name|tags|quality)$"))
             "document_type": document_type,
             "date": doc_date,
             "tags": tag_names,
-            "heuristic_quality": score_heuristic(title, tag_names),
+            "heuristic_quality": score_heuristic(title),
             "llm_quality": llm_quality,
             "metadata_completeness": score_completeness(title, tag_names, correspondent, document_type, doc_date),
             "suggestion_status": suggestion_status,
