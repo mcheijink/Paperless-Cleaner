@@ -362,7 +362,11 @@ tr.row-selected td { background: rgba(37,99,235,0.12); }
 
 .review-pane {
   position: fixed;
-  inset: 2vh 2vw;           /* ~96vw × 96vh, centred with a small margin */
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 82vw;
+  height: 85vh;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 0.6rem;
