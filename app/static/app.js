@@ -675,8 +675,18 @@ function refreshPane(docId) {
   const previewFrame = document.getElementById('panePreviewFrame');
   const previewUrl = `/api/documents/${docId}/preview`;
   if (previewFrame.dataset.docId !== String(docId)) {
-    previewFrame.src = previewUrl;
     previewFrame.dataset.docId = String(docId);
+    // Fetch as blob so the browser renders it inline rather than downloading
+    fetch(previewUrl)
+      .then(r => r.blob())
+      .then(blob => {
+        const blobUrl = URL.createObjectURL(blob);
+        // Revoke previous blob URL to free memory
+        if (previewFrame.dataset.blobUrl) URL.revokeObjectURL(previewFrame.dataset.blobUrl);
+        previewFrame.dataset.blobUrl = blobUrl;
+        previewFrame.src = blobUrl;
+      })
+      .catch(() => { previewFrame.src = ''; });
   }
   document.getElementById('panePreviewLink').href = previewUrl;
   const paperlessLink = document.getElementById('panePaperlessLink');
