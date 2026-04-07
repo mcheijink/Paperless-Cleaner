@@ -141,6 +141,7 @@
       <!-- Review pane modal -->
       <div id="paneBackdrop" class="pane-backdrop" style="display:none"></div>
       <aside id="reviewPane" class="review-pane" style="display:none">
+        <!-- Shared header spanning full width -->
         <div class="pane-header">
           <strong id="paneTitle">Document</strong>
           <div class="pane-header-actions">
@@ -150,20 +151,27 @@
             <button id="closePaneBtn" class="btn-icon" title="Close">✕</button>
           </div>
         </div>
-        <div class="pane-thumb">
-          <img id="paneThumb" src="" alt="Thumbnail" />
-          <a id="panePreviewLink" href="#" target="_blank" rel="noopener">Open PDF ↗</a>
+        <!-- Two-column body -->
+        <div class="pane-body">
+          <!-- Left: fields & actions -->
+          <div class="pane-left">
+            <div class="pane-fields" id="paneFields"></div>
+            <div class="pane-actions">
+              <button id="paneApplyAllBtn" class="btn-success" style="display:none">Apply &amp; Next →</button>
+              <button id="paneRejectAllBtn" class="btn-danger" style="display:none">Reject &amp; Next →</button>
+            </div>
+            <div class="pane-shortcuts">A = apply &amp; next &nbsp;·&nbsp; R = reject &amp; next &nbsp;·&nbsp; ← → = navigate</div>
+            <details id="paneReasoning" style="display:none">
+              <summary>Model reasoning</summary>
+              <p id="paneReasoningText" class="reasoning-text"></p>
+            </details>
+          </div>
+          <!-- Right: PDF preview -->
+          <div class="pane-right">
+            <iframe id="panePreviewFrame" src="" title="Document preview"></iframe>
+            <a id="panePreviewLink" href="#" target="_blank" rel="noopener" class="pane-preview-link">Open PDF in new tab ↗</a>
+          </div>
         </div>
-        <div class="pane-fields" id="paneFields"></div>
-        <div class="pane-actions">
-          <button id="paneApplyAllBtn" class="btn-success" style="display:none">Apply &amp; Next →</button>
-          <button id="paneRejectAllBtn" class="btn-danger" style="display:none">Reject &amp; Next →</button>
-        </div>
-        <div class="pane-shortcuts">A = apply &amp; next &nbsp;·&nbsp; R = reject &amp; next &nbsp;·&nbsp; ← → = navigate</div>
-        <details id="paneReasoning" style="display:none">
-          <summary>Model reasoning</summary>
-          <p id="paneReasoningText" class="reasoning-text"></p>
-        </details>
       </aside>
 
       <!-- Column filter dropdown (shared, moved by JS) -->

@@ -109,17 +109,34 @@ function setFieldState(docId, field, state) {
 function checkAllResolved(docId) {
   const sug = suggestions.get(docId);
   if (!sug) return;
+  const entry = currentEntries.find(e => e.id === docId);
   const states = fieldStates.get(docId) || {};
-  const fields = relevantFields(sug);
+  // Use actionable fields only: tags only count if there's an actual diff
+  const fields = actionableFields(docId, sug, entry);
   if (fields.every(f => states[f] && states[f] !== 'undecided')) {
     // Update entry suggestion_status locally
-    const entry = currentEntries.find(e => e.id === docId);
     if (entry) entry.suggestion_status = 'done';
     // Re-render row
     renderTable(filteredEntries);
     updateToolbarCounts();
     if (openPaneDocId === docId) refreshPane(docId);
   }
+}
+
+function actionableFields(docId, sug, entry) {
+  const fields = ['title'];
+  if (sug.suggested_correspondent) fields.push('correspondent');
+  if (sug.suggested_document_type) fields.push('document_type');
+  if (sug.suggested_tags && sug.suggested_tags.length) {
+    // Only include tags if there is an actual diff (add or remove)
+    const sugNames = new Set(sug.suggested_tags.map(t => t.name.toLowerCase()));
+    const protected_ = new Set((sug.protected_tags || []).map(t => t.toLowerCase()));
+    const currentLower = (entry?.tags || []).map(x => x.toLowerCase());
+    const hasDiff = sug.suggested_tags.some(t => !currentLower.includes(t.name.toLowerCase()))
+        || (entry?.tags || []).some(t => !sugNames.has(t.toLowerCase()) && !protected_.has(t.toLowerCase()));
+    if (hasDiff) fields.push('tags');
+  }
+  return fields;
 }
 
 function relevantFields(sug) {
@@ -655,9 +672,13 @@ function refreshPane(docId) {
   if (!entry) return;
 
   document.getElementById('paneTitle').textContent = entry.title;
-  const thumb = document.getElementById('paneThumb');
-  thumb.src = `/api/documents/${docId}/thumb`;
-  document.getElementById('panePreviewLink').href = `/api/documents/${docId}/preview`;
+  const previewFrame = document.getElementById('panePreviewFrame');
+  const previewUrl = `/api/documents/${docId}/preview`;
+  if (previewFrame.dataset.docId !== String(docId)) {
+    previewFrame.src = previewUrl;
+    previewFrame.dataset.docId = String(docId);
+  }
+  document.getElementById('panePreviewLink').href = previewUrl;
   const paperlessLink = document.getElementById('panePaperlessLink');
   if (paperlessBaseUrl) {
     paperlessLink.href = `${paperlessBaseUrl}/documents/${docId}/details`;
