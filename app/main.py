@@ -1118,4 +1118,8 @@ async def proxy_preview(doc_id: int) -> StreamingResponse:
             await resp.aclose()
             await client.aclose()
 
-    return StreamingResponse(_stream(), media_type="application/pdf")
+    return StreamingResponse(
+        _stream(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline"},
+    )
