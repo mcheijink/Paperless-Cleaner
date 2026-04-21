@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Paperless Cleaner — Duplicates</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Paperless Cleaner</h1>
+      <nav style="display:flex;align-items:center;gap:1rem;">
+        <a href="/">Metadata</a>
+        <a href="/duplicates" style="color:var(--text)">Duplicates</a>
+        <a href="/settings">Settings</a>
+      </nav>
+    </header>
+
+    <main id="mainLayout">
+
+      <!-- Toolbar -->
+      <section class="toolbar">
+        <button id="scanBtn">Scan for duplicates</button>
+        <span id="scanSummary" class="progress-label" style="display:none"></span>
+      </section>
+
+      <!-- Progress bar -->
+      <section id="progressSection" style="display:none">
+        <div style="display:flex;align-items:center;gap:0.6rem;">
+          <div class="progress-bar-track" style="flex:1">
+            <div class="progress-bar-fill" id="progressFill"></div>
+          </div>
+          <span id="progressPhase" class="progress-label" style="white-space:nowrap;font-weight:600"></span>
+        </div>
+        <span id="progressLabel" class="progress-label"></span>
+      </section>
+
+      <!-- Results -->
+      <section id="resultsSection" style="display:none">
+        <div id="groupsContainer"></div>
+      </section>
+
+      <!-- Empty state -->
+      <section id="emptyState" style="display:none">
+        <p style="color:var(--text-muted);padding:2rem 0;">No potential duplicates found.</p>
+      </section>
+
+    </main>
+
+    <!-- Side-by-side preview modal -->
+    <div id="previewBackdrop" class="pane-backdrop" style="display:none"></div>
+    <div id="previewModal" class="dup-preview-modal" style="display:none">
+      <div class="pane-header">
+        <strong id="previewTitle">Compare documents</strong>
+        <div class="pane-header-actions">
+          <button id="closePreviewBtn" class="btn-icon" title="Close">✕</button>
+        </div>
+      </div>
+      <div id="previewPanes" class="dup-preview-panes"></div>
+    </div>
+
+    <script src="/static/duplicates.js"></script>
+  </body>
+</html>

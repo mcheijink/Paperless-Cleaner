@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+from collections import defaultdict
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -1085,6 +1086,301 @@ async def apply_changes(payload: ApplyRequest) -> dict[str, Any]:
             _transient_fallback.pop(doc_id_str, None)
 
     return {"status": "ok", "updated": len(payload.entries), "tags_created": tags_created}
+
+
+# ---------------------------------------------------------------------------
+# Duplicate detection
+# ---------------------------------------------------------------------------
+
+def _title_tokens(title: str) -> set[str]:
+    """Normalise a title to a set of lowercase alphabetic tokens (≥3 chars)."""
+    return {w.lower() for w in re.findall(r"[a-z]{3,}", title, re.IGNORECASE)}
+
+
+def _token_overlap(a: set[str], b: set[str]) -> float:
+    """Overlap = intersection / size-of-smaller-set (0.0–1.0)."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
+def _content_similarity(a: str, b: str, sample: int = 800) -> float:
+    """Character-level Jaccard on 3-grams of the first `sample` chars."""
+    def trigrams(s: str) -> set[str]:
+        s = re.sub(r"\s+", " ", s.lower().strip())[:sample]
+        return {s[i:i+3] for i in range(len(s) - 2)}
+    ta, tb = trigrams(a), trigrams(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _sse(event: str, data: Any) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.get("/duplicates", response_class=HTMLResponse)
+async def duplicates_page(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse("duplicates.html", {"request": request})
+
+
+@app.get("/api/duplicates/scan")
+async def scan_duplicates() -> StreamingResponse:
+    """
+    Three-pass duplicate scan streamed as SSE events.
+
+    Events emitted:
+      progress  { phase: int, phase_label: str, detail: str }
+      result    { confidence, reason, llm_verdict, llm_reasoning, documents: [...], snippets: {...} }
+      done      { total: int }
+      error     { message: str }
+    """
+
+    async def _generate():
+        try:
+            settings = load_settings()
+
+            # ── Phase 1: fetch docs & build metadata candidates ────────────────
+            yield _sse("progress", {"phase": 1, "phase_label": "Phase 1/3", "detail": "Fetching documents from Paperless…"})
+            tag_map, corr_map, dtype_map, docs = await asyncio.gather(
+                get_tag_map(settings),
+                get_correspondent_map(settings),
+                get_document_type_map(settings),
+                get_documents(settings),
+            )
+
+            yield _sse("progress", {"phase": 1, "phase_label": "Phase 1/3", "detail": f"Analysing metadata for {len(docs)} documents…"})
+
+            entries: list[dict[str, Any]] = []
+            for d in docs:
+                corr_id = d.get("correspondent")
+                dtype_id = d.get("document_type")
+                raw_date = d.get("created") or ""
+                date_str = raw_date[:10] if raw_date else ""
+                title = d.get("title", "")
+                tokens = _title_tokens(title)
+                is_filename = bool(_FILENAME_RE.search(title.strip()) or ("_" in title and " " not in title))
+                tag_names = [tag_map.get(tid, str(tid)) for tid in d.get("tags", [])]
+                correspondent = corr_map.get(corr_id) if corr_id else None
+                document_type = dtype_map.get(dtype_id) if dtype_id else None
+                content = d.get("content") or ""
+                hq = score_heuristic(title)
+                completeness = score_completeness(title, tag_names, correspondent, document_type, date_str)
+                entries.append({
+                    "id": d["id"],
+                    "title": title,
+                    "correspondent": correspondent,
+                    "document_type": document_type,
+                    "date": date_str,
+                    "tags": tag_names,
+                    "tokens": tokens,
+                    "is_filename": is_filename,
+                    "heuristic_quality": hq,
+                    "completeness": completeness,
+                    "content": content,
+                    "content_len": len(content),
+                })
+
+            # Build raw candidate groups (all start as "possible")
+            raw_groups: list[dict[str, Any]] = []
+            used_ids: set[int] = set()
+
+            triple_groups: dict[tuple, list[dict]] = defaultdict(list)
+            for e in entries:
+                if e["date"] and e["correspondent"] and e["document_type"]:
+                    triple_groups[(e["date"], e["correspondent"], e["document_type"])].append(e)
+            for (date_v, corr_v, dtype_v), grp in triple_groups.items():
+                if len(grp) >= 2:
+                    raw_groups.append({
+                        "meta_reason": f"Same date, correspondent & document type ({corr_v} · {date_v} · {dtype_v})",
+                        "docs": grp,
+                    })
+                    for e in grp:
+                        used_ids.add(e["id"])
+
+            pair_groups: dict[tuple, list[dict]] = defaultdict(list)
+            for e in entries:
+                if e["id"] not in used_ids and e["date"] and e["correspondent"]:
+                    pair_groups[(e["date"], e["correspondent"])].append(e)
+            for (date_v, corr_v), grp in pair_groups.items():
+                if len(grp) >= 2:
+                    raw_groups.append({
+                        "meta_reason": f"Same date & correspondent ({corr_v} · {date_v})",
+                        "docs": grp,
+                    })
+                    for e in grp:
+                        used_ids.add(e["id"])
+
+            title_candidates = [e for e in entries if e["id"] not in used_ids and e["tokens"] and not e["is_filename"]]
+            merged_used: set[int] = set()
+            for i, a in enumerate(title_candidates):
+                if a["id"] in merged_used:
+                    continue
+                group: list[dict] = [a]
+                for j, b in enumerate(title_candidates):
+                    if i == j or b["id"] in merged_used:
+                        continue
+                    if _token_overlap(a["tokens"], b["tokens"]) >= 0.60:
+                        group.append(b)
+                        merged_used.add(b["id"])
+                if len(group) >= 2:
+                    merged_used.add(a["id"])
+                    raw_groups.append({"meta_reason": "Similar title", "docs": group})
+
+            yield _sse("progress", {"phase": 1, "phase_label": "Phase 1/3", "detail": f"Found {len(raw_groups)} candidate group(s)."})
+
+            # ── Phase 2: content similarity for every candidate pair ───────────
+            yield _sse("progress", {"phase": 2, "phase_label": "Phase 2/3", "detail": f"Comparing content for {len(raw_groups)} group(s)…"})
+
+            # Attach pairwise content similarity to each group
+            for g in raw_groups:
+                docs_in = g["docs"]
+                pairs: list[dict] = []
+                for i in range(len(docs_in)):
+                    for j in range(i + 1, len(docs_in)):
+                        sim = _content_similarity(docs_in[i]["content"], docs_in[j]["content"])
+                        pairs.append({
+                            "id_a": docs_in[i]["id"],
+                            "id_b": docs_in[j]["id"],
+                            "similarity": round(sim, 3),
+                        })
+                g["pairs"] = pairs
+                # Max similarity across all pairs in the group
+                g["max_similarity"] = max((p["similarity"] for p in pairs), default=0.0)
+
+            # ── Phase 3: LLM review for ambiguous pairs (sim 0.35–0.85) ────────
+            ambiguous = [g for g in raw_groups if 0.35 <= g["max_similarity"] < 0.85]
+            yield _sse("progress", {
+                "phase": 3,
+                "phase_label": "Phase 3/3",
+                "detail": f"LLM reviewing {len(ambiguous)} ambiguous group(s)…" if ambiguous else "No ambiguous groups — skipping LLM.",
+            })
+
+            for idx, g in enumerate(ambiguous):
+                docs_in = g["docs"]
+                # Build snippet pairs for LLM — use first 300 chars of each doc
+                snippets_for_llm = [
+                    {"id": e["id"], "title": e["title"], "snippet": e["content"][:300]}
+                    for e in docs_in
+                ]
+                snippet_text = "\n\n".join(
+                    f'Document {i+1} (id={s["id"]}, title="{s["title"]}"):\n{s["snippet"]}'
+                    for i, s in enumerate(snippets_for_llm)
+                )
+
+                llm_prompt_system = """/no_think
+You are a document duplicate detector. Given content snippets from two or more documents, decide whether they are:
+- "duplicate": the same document uploaded/scanned more than once (content is the same)
+- "same_template": the same form or letter sent to different people (same structure, different recipient/personal details)
+- "different": distinct documents that happen to share metadata
+
+Respond with a single JSON object:
+{"verdict": "duplicate"|"same_template"|"different", "reasoning": "one sentence explanation"}
+
+No text outside the JSON."""
+
+                llm_prompt_user = f"Compare these document snippets:\n\n{snippet_text}"
+
+                llm_verdict = "unknown"
+                llm_reasoning = ""
+                try:
+                    from openai import AsyncOpenAI
+                    base = settings.ollama_base_url.rstrip("/")
+                    openai_client = AsyncOpenAI(base_url=f"{base}/v1", api_key="ollama")
+                    llm_client = instructor.from_openai(openai_client, mode=instructor.Mode.JSON)
+
+                    class _LLMVerdict(BaseModel):
+                        verdict: str = "different"
+                        reasoning: str = ""
+
+                    resp: _LLMVerdict = await asyncio.wait_for(
+                        llm_client.chat.completions.create(
+                            model=settings.ollama_model,
+                            messages=[
+                                {"role": "system", "content": llm_prompt_system},
+                                {"role": "user", "content": llm_prompt_user},
+                            ],
+                            response_model=_LLMVerdict,
+                            temperature=0.0,
+                        ),
+                        timeout=60.0,
+                    )
+                    llm_verdict = resp.verdict if resp.verdict in ("duplicate", "same_template", "different") else "unknown"
+                    llm_reasoning = resp.reasoning
+                except Exception:
+                    logger.exception("LLM verdict failed for duplicate group, skipping")
+                    llm_verdict = "unknown"
+
+                g["llm_verdict"] = llm_verdict
+                g["llm_reasoning"] = llm_reasoning
+
+                yield _sse("progress", {
+                    "phase": 3,
+                    "phase_label": "Phase 3/3",
+                    "detail": f"LLM reviewed group {idx + 1}/{len(ambiguous)}: {llm_verdict}",
+                })
+
+            # ── Assign final confidence & emit results ─────────────────────────
+            total_emitted = 0
+            for g in raw_groups:
+                sim = g["max_similarity"]
+                llm_verdict = g.get("llm_verdict")
+
+                # Confidence logic:
+                # High   → content nearly identical (≥ 0.85) OR ambiguous but LLM says duplicate
+                # Medium → ambiguous (0.35–0.85) and LLM is unknown/same_template, OR metadata match with low sim
+                # Possible → low content sim, metadata match only
+                # Drop   → LLM says "different"
+                if llm_verdict == "different":
+                    continue  # discard — LLM ruled it out
+                if sim >= 0.85:
+                    confidence = "high"
+                elif llm_verdict == "duplicate":
+                    confidence = "high"
+                elif 0.35 <= sim < 0.85 and llm_verdict == "same_template":
+                    confidence = "possible"
+                elif sim >= 0.35:
+                    confidence = "medium"
+                else:
+                    confidence = "possible"
+
+                docs_in = g["docs"]
+                best_id = max(docs_in, key=lambda e: (e["content_len"], e["completeness"], e["heuristic_quality"]))["id"]
+                snippets_out = {e["id"]: e["content"][:400] for e in docs_in}
+
+                yield _sse("result", {
+                    "confidence": confidence,
+                    "reason": g["meta_reason"],
+                    "llm_verdict": llm_verdict,
+                    "llm_reasoning": g.get("llm_reasoning", ""),
+                    "pairs": g["pairs"],
+                    "best_id": best_id,
+                    "snippets": snippets_out,
+                    "documents": [
+                        {
+                            "id": e["id"],
+                            "title": e["title"],
+                            "correspondent": e["correspondent"],
+                            "document_type": e["document_type"],
+                            "date": e["date"],
+                            "tags": e["tags"],
+                            "heuristic_quality": e["heuristic_quality"],
+                            "completeness": e["completeness"],
+                            "content_len": e["content_len"],
+                            "is_best": e["id"] == best_id,
+                        }
+                        for e in docs_in
+                    ],
+                })
+                total_emitted += 1
+
+            yield _sse("done", {"total": total_emitted})
+
+        except Exception as exc:
+            logger.exception("Duplicate scan failed")
+            yield _sse("error", {"message": str(exc)})
+
+    return StreamingResponse(_generate(), media_type="text/event-stream")
 
 
 @app.get("/api/documents/{doc_id}/thumb")
