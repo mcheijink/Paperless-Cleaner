@@ -4,6 +4,7 @@ services:
     ports:
       - "8200:8080"
     volumes:
-      - ./app/settings.json:/app/app/settings.json
+      # settings.json (incl. the Paperless token) lives here and survives container recreation
+      - ./config:/app/config
     restart: unless-stopped
     stop_grace_period: 70s

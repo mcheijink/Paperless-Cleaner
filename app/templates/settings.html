@@ -8,9 +8,9 @@
   </head>
   <body>
     <header>
-      <h1>Settings</h1>
+      <h1>Paperless Cleaner</h1>
       <nav style="display:flex;align-items:center;gap:1rem;">
-        <a href="/">Metadata</a>
+        <a href="/">Review metadata</a>
         <a href="/duplicates">Duplicates</a>
         <a href="/settings" style="color:var(--text)">Settings</a>
       </nav>
@@ -25,8 +25,12 @@
           </label>
           <label>API Token
             <input name="paperless_token" type="password" autocomplete="off" />
-            <small>Shown as *** when a token is configured.</small>
+            <small>Shown as *** when a token is configured. Create one in Paperless under My Profile → API Auth Token.</small>
           </label>
+          <div class="test-row">
+            <button type="button" id="testPaperlessBtn" class="btn-secondary">Test Paperless connection</button>
+            <span id="testPaperlessResult" class="test-result" role="status"></span>
+          </div>
         </fieldset>
 
         <fieldset>
@@ -37,6 +41,7 @@
               <option value="heuristic">Heuristic (offline)</option>
             </select>
           </label>
+          <div id="ollamaFields" style="display:grid;gap:0.65rem">
           <label>Ollama Base URL
             <input name="ollama_base_url" />
           </label>
@@ -55,11 +60,16 @@
             <input name="few_shot_min_documents" type="number" min="0" step="1" />
             <small>Minimum reviewed documents before library examples replace built-in examples in the prompt.</small>
           </label>
+          <div class="test-row">
+            <button type="button" id="testOllamaBtn" class="btn-secondary">Test Ollama connection</button>
+            <span id="testOllamaResult" class="test-result" role="status"></span>
+          </div>
+          </div>
         </fieldset>
 
         <div class="toolbar">
           <button type="submit">Save settings</button>
-          <span id="status"></span>
+          <span id="status" class="form-status" role="status"></span>
         </div>
       </form>
     </main>

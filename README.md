@@ -23,13 +23,7 @@ A self-hosted web application that sits alongside [Paperless-NGX](https://docs.p
 
 ## Quick start
 
-1. Create the settings file (required before first run):
-
-   ```bash
-   touch app/settings.json
-   ```
-
-   > The file must exist on the host before running `docker compose up`. If it is missing, Docker creates a directory at that path instead of a file, breaking settings persistence.
+1. Settings are stored in `config/settings.json`, in the `./config` directory that `docker-compose.yml` mounts at `/app/config`. Docker creates the directory on first run — nothing to prepare. When you deploy the image elsewhere, mount a volume at `/app/config`, otherwise settings (including the API token) are lost whenever the container is recreated.
 
 2. Start the container:
 
@@ -43,7 +37,7 @@ On first start the app auto-creates three Paperless-NGX custom fields: **LLM qua
 
 ## Configuration
 
-Open `/settings` and fill in the fields below. Settings are saved to `app/settings.json` and take effect immediately without a restart. They can also be seeded from environment variables on first run.
+Open `/settings` and fill in the fields below. Settings are saved to `config/settings.json` and take effect immediately without a restart. They can also be seeded from environment variables on first run.
 
 | Field | Description | Default | Env var |
 |---|---|---|---|
@@ -61,11 +55,13 @@ Open `/settings` and fill in the fields below. Settings are saved to `app/settin
 ## Workflow
 
 1. **Refresh** — loads all documents and quality scores.
-2. **Select** — tick checkboxes, or leave all unchecked to queue every visible document.
+2. **Select** — tick checkboxes, or use **Select 25 worst unreviewed**. Ticking only selects; it never writes anything.
 3. **Generate suggestions** — queues documents for LLM processing. The progress bar shows ETA and per-document timing. Click the bar to see the full queue. You can add more documents while the queue is running.
-4. **Show suggestions** — toggle to add suggestion columns to the table with per-field Apply/Reject.
-5. **Review pane** — click any row to open. Use **Apply & Next →** or **Reject & Next →** (or keyboard shortcuts) to move through the queue efficiently.
-6. **Apply all approved** — sends all applied changes to Paperless-NGX.
+4. **Review N suggestions** — appears when results are ready and opens the review pane on the first one. Use **Apply & Next →** or **Reject & Next →** (or keyboard shortcuts) to move through the queue; the header shows "3 of 8 to review". Every Apply writes to Paperless-NGX immediately and offers **Undo**.
+5. **Show suggestions in table** — optional toggle that adds suggestion columns with per-field ✓ / ✕.
+6. **Accept all suggestions for N selected** — bulk shortcut that writes every undecided suggestion of the ticked documents, after a confirmation.
+
+The line above the toolbar always shows what is loaded, how many documents are waiting for review, and how many are queued. If review state cannot be read from Paperless, a warning banner says so instead of silently showing every document as unreviewed.
 
 ## Quality scores
 
@@ -133,6 +129,6 @@ requirements.txt
 
 ## Security notes
 
-- `app/settings.json` contains your Paperless API token and is gitignored — never commit it.
+- `config/settings.json` contains your Paperless API token. `config/` is gitignored and excluded from the Docker build context — never commit it.
 - The token is masked (`***`) in all API responses to the browser.
 - The app is designed for trusted local network use. There is no built-in authentication.

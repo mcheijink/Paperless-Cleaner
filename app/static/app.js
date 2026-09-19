@@ -15,7 +15,7 @@ let currentEntries = [];       // all entries from last /api/entries fetch
 let filteredEntries = [];      // after client-side filter+sort
 let suggestions = new Map();   // docId → Suggestion object
 let fieldStates = new Map();   // docId → {title,correspondent,document_type,tags} → "undecided"|"applied"|"rejected"
-let approvedDocs = new Set();  // docIds with "approve" checked
+let selectedDocs = new Set();  // docIds ticked in the table — selection only, never implies approval
 
 let activeSortCol = 'quality';
 let activeSortDir = 'asc';
@@ -29,6 +29,8 @@ let refreshInFlight = false;
 let applyInFlight = false;
 let paperlessBaseUrl = '';
 let lastQueueData = null;
+let entriesLoaded = false;
+let loadFailed = false;      // true while the table shows a load error
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const refreshBtn      = document.getElementById('refreshBtn');
@@ -36,6 +38,13 @@ const suggestBtn      = document.getElementById('suggestBtn');
 const showSuggestBtn  = document.getElementById('showSuggestBtn');
 const applyAllBtn     = document.getElementById('applyAllBtn');
 const cancelQueueBtn  = document.getElementById('cancelQueueBtn');
+const reviewBtn       = document.getElementById('reviewBtn');
+const selectWorstBtn  = document.getElementById('selectWorstBtn');
+const clearSelBtn     = document.getElementById('clearSelectionBtn');
+const selectedCountEl = document.getElementById('selectedCount');
+const statusStrip     = document.getElementById('statusStrip');
+const warningBanner   = document.getElementById('warningBanner');
+const toastHost       = document.getElementById('toastHost');
 const readyCountEl    = document.getElementById('readyCount');
 const approvedCountEl = document.getElementById('approvedCount');
 const progressSection = document.getElementById('progressSection');
@@ -67,6 +76,7 @@ const helpModal    = document.getElementById('helpModal');
 document.getElementById('helpBtn').addEventListener('click', () => {
   helpBackdrop.style.display = '';
   helpModal.style.display = '';
+  helpModal.focus();
 });
 document.getElementById('closeHelpBtn').addEventListener('click', closeHelp);
 helpBackdrop.addEventListener('click', closeHelp);
@@ -79,16 +89,59 @@ function closeHelp() {
 }
 
 // ── Utility ───────────────────────────────────────────────────────────────────
-function statusDot(entry) {
-  if (entry.fallback_used) return '<span class="status-dot status-fallback" title="Ollama failed; heuristic used"></span>';
-  const cls = { none: 'status-none', pending: 'status-pending', ready: 'status-ready', done: 'status-done' };
-  const t   = { none: 'No suggestion', pending: 'Queued / processing', ready: 'Suggestion ready', done: 'Reviewed' };
+const STATUS_LABEL = { none: 'No suggestion', pending: 'Queued', ready: 'Suggestion ready', done: 'Reviewed' };
+const COLUMN_LABEL = {
+  status: 'Status', title: 'Title', correspondent: 'Correspondent', document_type: 'Document type',
+  date: 'Date', tags: 'Tags', quality: 'Quality', metadata_completeness: 'Completeness',
+  metadata_reviewed: 'Reviewed',
+};
+
+function statusBadge(entry) {
   const s = entry.suggestion_status || 'none';
-  return `<span class="status-dot ${cls[s] || 'status-none'}" title="${t[s] || s}"></span>`;
+  if (entry.fallback_used && s === 'ready') {
+    return '<span class="status-badge status-fallback" title="The LLM failed; a simple heuristic suggestion was used">Ready (fallback)</span>';
+  }
+  return `<span class="status-badge status-${esc(s)}">${esc(STATUS_LABEL[s] || s)}</span>`;
 }
 
 function qualityDisplay(entry) {
-  return entry.llm_quality != null ? entry.llm_quality : (entry.heuristic_quality ?? '—');
+  if (entry.llm_quality != null) return `<span title="LLM title-quality score">${esc(entry.llm_quality)}</span>`;
+  if (entry.heuristic_quality == null) return '—';
+  return `<span class="quality-heuristic" title="Heuristic estimate — no LLM score yet">~${esc(entry.heuristic_quality)}</span>`;
+}
+
+async function errorMessage(resp) {
+  const text = await resp.text();
+  try {
+    const detail = JSON.parse(text).detail;
+    if (typeof detail === 'string') return detail;
+  } catch (_) {}
+  return text || `HTTP ${resp.status}`;
+}
+
+// ── Toasts ────────────────────────────────────────────────────────────────────
+function showToast(message, { undo = null, kind = 'info', timeout = 8000 } = {}) {
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${kind}`;
+  toast.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+  const text = document.createElement('span');
+  text.textContent = message;
+  toast.appendChild(text);
+  if (undo) {
+    const btn = document.createElement('button');
+    btn.className = 'toast-undo';
+    btn.textContent = 'Undo';
+    btn.addEventListener('click', async () => { toast.remove(); await undo(); });
+    toast.appendChild(btn);
+  }
+  const close = document.createElement('button');
+  close.className = 'toast-close';
+  close.setAttribute('aria-label', 'Dismiss');
+  close.textContent = '×';
+  close.addEventListener('click', () => toast.remove());
+  toast.appendChild(close);
+  toastHost.appendChild(toast);
+  if (timeout) setTimeout(() => toast.remove(), timeout);
 }
 
 function tagsHtml(tags) {
@@ -165,10 +218,15 @@ function hasActionableUndecided(docId) {
   });
 }
 
+function docsToReview() {
+  return filteredEntries.filter(e => hasActionableUndecided(e.id));
+}
+
+// Returns true when it moved to another document
 function openNextDocToReview(direction = 1) {
-  if (!openPaneDocId) return;
+  if (!openPaneDocId) return false;
   const currentIdx = filteredEntries.findIndex(e => e.id === openPaneDocId);
-  if (currentIdx === -1) return;
+  if (currentIdx === -1) return false;
   const n = filteredEntries.length;
   // Search forward (or backward) for a doc with actionable undecided suggestions
   for (let i = 1; i < n; i++) {
@@ -176,11 +234,17 @@ function openNextDocToReview(direction = 1) {
     const candidate = filteredEntries[idx];
     if (hasActionableUndecided(candidate.id)) {
       openReviewPane(candidate.id);
-      return;
+      return true;
     }
   }
-  // No actionable doc found — close the pane
-  closeReviewPane();
+  return false;
+}
+
+// After acting on a whole document: move on, or say clearly that the queue is empty
+function advanceAfterDecision() {
+  if (openNextDocToReview(1)) return;
+  if (openPaneDocId) refreshPane(openPaneDocId);
+  if (!docsToReview().length && suggestions.size) showToast('All suggestions reviewed.', { kind: 'success' });
 }
 
 // ── Load entries ──────────────────────────────────────────────────────────────
@@ -189,14 +253,28 @@ async function loadEntries() {
   refreshInFlight = true;
   refreshBtn.textContent = 'Refreshing…';
   refreshBtn.disabled = true;
+  if (!entriesLoaded) showTableMessage('Loading documents from Paperless…');
+  statusStrip.textContent = 'Loading documents…';
 
   try {
-    const response = await fetch('/api/entries?sort_by=quality');
-    if (!response.ok) {
-      entryRows.innerHTML = `<tr><td colspan="20" style="color:#f87171">Failed to load: ${esc(await response.text())}</td></tr>`;
+    let response;
+    try {
+      response = await fetch('/api/entries?sort_by=quality');
+    } catch (err) {
+      showLoadError('Could not reach the Paperless Cleaner server. Check your network connection.');
       return;
     }
-    currentEntries = await response.json();
+    if (!response.ok) {
+      showLoadError(await errorMessage(response));
+      return;
+    }
+    const payload = await response.json();
+    currentEntries = payload.entries;
+    entriesLoaded = true;
+    loadFailed = false;
+    const warnings = payload.warnings || [];
+    warningBanner.hidden = warnings.length === 0;
+    warningBanner.textContent = warnings.join(' ');
     // Merge local suggestion_status from our in-flight state
     for (const entry of currentEntries) {
       const sug = suggestions.get(entry.id);
@@ -215,6 +293,21 @@ async function loadEntries() {
   }
 }
 
+function showTableMessage(html) {
+  entryRows.innerHTML = `<tr class="table-message"><td colspan="20">${html}</td></tr>`;
+}
+
+function showLoadError(message) {
+  loadFailed = true;
+  currentEntries = [];
+  filteredEntries = [];
+  statusStrip.textContent = 'Documents could not be loaded.';
+  showTableMessage(`<span class="error-text">${esc(message)}</span>
+    <button id="retryLoadBtn" class="btn-secondary">Retry</button>
+    <a href="/settings">Check connection settings</a>`);
+  document.getElementById('retryLoadBtn').addEventListener('click', loadEntries);
+}
+
 // ── Filter + sort ─────────────────────────────────────────────────────────────
 function applyFilterSort() {
   let data = [...currentEntries];
@@ -226,8 +319,22 @@ function applyFilterSort() {
 
   data = sortData(data, activeSortCol, activeSortDir);
   filteredEntries = data;
+  const visibleIds = new Set(data.map(e => e.id));
+  for (const id of [...selectedDocs]) if (!visibleIds.has(id)) selectedDocs.delete(id);
   renderTable(data);
   renderFilterChips();
+  renderSortArrows();
+  updateToolbarCounts();
+}
+
+function renderSortArrows() {
+  document.querySelectorAll('#tableHeaderRow th[data-col]').forEach(th => {
+    const active = th.dataset.col === activeSortCol;
+    th.classList.toggle('col-active', active);
+    th.setAttribute('aria-sort', active ? (activeSortDir === 'asc' ? 'ascending' : 'descending') : 'none');
+    const arrow = th.querySelector('.sort-arrow');
+    if (arrow) arrow.textContent = active ? (activeSortDir === 'asc' ? '↑' : '↓') : '▾';
+  });
 }
 
 function matchFilter(entry, col, filter) {
@@ -277,6 +384,18 @@ function sortData(data, col, dir) {
 
 // ── Render table ──────────────────────────────────────────────────────────────
 function renderTable(data) {
+  if (!data.length) {
+    updateSuggestionColumns();
+    if (!entriesLoaded || loadFailed) return;  // keep the loading / error message
+    if (currentEntries.length) {
+      showTableMessage('No documents match these filters. <button id="emptyClearFilters" class="btn-secondary">Clear filters</button>');
+      document.getElementById('emptyClearFilters').addEventListener('click', () => { activeFilters = {}; applyFilterSort(); });
+    } else {
+      showTableMessage('No documents found in Paperless. <a href="/settings">Check the connection in Settings</a>.');
+    }
+    selectAll.checked = false;
+    return;
+  }
   const fragment = document.createDocumentFragment();
 
   for (const entry of data) {
@@ -287,14 +406,14 @@ function renderTable(data) {
     const states = fieldStates.get(entry.id) || {};
 
     let cells = `
-      <td class="col-check"><input type="checkbox" class="row-check" data-id="${entry.id}" ${approvedDocs.has(entry.id) ? 'checked' : ''} /></td>
-      <td>${statusDot(entry)}</td>
+      <td class="col-check"><input type="checkbox" class="row-check" data-id="${entry.id}" aria-label="Select document" ${selectedDocs.has(entry.id) ? 'checked' : ''} /></td>
+      <td>${statusBadge(entry)}</td>
       <td title="${esc(entry.title)}">${esc(entry.title)}</td>
       <td>${esc(entry.correspondent || '—')}</td>
       <td>${esc(entry.document_type || '—')}</td>
       <td>${esc(entry.date ? entry.date.slice(0, 10) : '—')}</td>
       <td>${tagsHtml(entry.tags)}</td>
-      <td>${esc(qualityDisplay(entry))}</td>
+      <td>${qualityDisplay(entry)}</td>
       <td>${esc(entry.metadata_completeness)}</td>
       <td>${esc(entry.metadata_reviewed || '—')}</td>
     `;
@@ -312,8 +431,8 @@ function renderTable(data) {
       } else {
         cells += `<td><div class="sug-cell">
           <span class="sug-value">${esc(sug.suggested_tags.map(t=>t.name).join(', '))}</span>
-          <button class="apply-btn" data-action="apply" data-id="${entry.id}" data-field="tags">✓</button>
-          <button class="reject-btn" data-action="reject" data-id="${entry.id}" data-field="tags">✕</button>
+          <button class="apply-btn" data-action="apply" data-id="${entry.id}" data-field="tags" title="Apply to Paperless" aria-label="Apply suggested tags">✓</button>
+          <button class="reject-btn" data-action="reject" data-id="${entry.id}" data-field="tags" title="Reject" aria-label="Reject suggested tags">✕</button>
         </div></td>`;
       }
     } else if (suggestionsVisible) {
@@ -321,16 +440,21 @@ function renderTable(data) {
     }
 
     tr.innerHTML = cells;
+    tr.tabIndex = 0;
     tr.querySelector('.row-check')?.addEventListener('change', onRowCheckChange);
     tr.addEventListener('click', e => {
       if (e.target.type === 'checkbox' || e.target.tagName === 'BUTTON') return;
       openReviewPane(entry.id);
+    });
+    tr.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && e.target === tr) { e.preventDefault(); openReviewPane(entry.id); }
     });
     fragment.appendChild(tr);
   }
 
   entryRows.innerHTML = '';
   entryRows.appendChild(fragment);
+  selectAll.checked = data.every(e => selectedDocs.has(e.id));
 
   // Wire inline apply/reject buttons
   entryRows.querySelectorAll('[data-action]').forEach(btn => {
@@ -347,8 +471,8 @@ function sugColumnCell(docId, field, value, states) {
   if (state === 'rejected') return `<td><span class="sug-rejected">${esc(value)}</span></td>`;
   return `<td><div class="sug-cell">
     <span class="sug-value">${esc(value)}</span>
-    <button class="apply-btn" data-action="apply" data-id="${docId}" data-field="${field}">✓</button>
-    <button class="reject-btn" data-action="reject" data-id="${docId}" data-field="${field}">✕</button>
+    <button class="apply-btn" data-action="apply" data-id="${docId}" data-field="${field}" title="Apply to Paperless" aria-label="Apply suggestion">✓</button>
+    <button class="reject-btn" data-action="reject" data-id="${docId}" data-field="${field}" title="Reject" aria-label="Reject suggestion">✕</button>
   </div></td>`;
 }
 
@@ -368,7 +492,7 @@ function updateSuggestionColumns() {
 // ── Row checkbox ──────────────────────────────────────────────────────────────
 function onRowCheckChange(e) {
   const id = Number(e.target.dataset.id);
-  if (e.target.checked) approvedDocs.add(id); else approvedDocs.delete(id);
+  if (e.target.checked) selectedDocs.add(id); else selectedDocs.delete(id);
   updateToolbarCounts();
 }
 
@@ -377,34 +501,68 @@ selectAll.addEventListener('change', () => {
   entryRows.querySelectorAll('.row-check').forEach(cb => {
     const id = Number(cb.dataset.id);
     cb.checked = checked;
-    if (checked) approvedDocs.add(id); else approvedDocs.delete(id);
+    if (checked) selectedDocs.add(id); else selectedDocs.delete(id);
   });
   updateToolbarCounts();
 });
 
 // ── Toolbar counts ────────────────────────────────────────────────────────────
 function updateToolbarCounts() {
-  const readyCount = currentEntries.filter(e => e.suggestion_status === 'ready').length;
-  readyCountEl.textContent = readyCount;
-  showSuggestBtn.style.display = readyCount > 0 || suggestionsVisible ? '' : 'none';
+  // "To review" counts what the Review button will actually open
+  const toReview = currentEntries.filter(e => hasActionableUndecided(e.id)).length;
+  const queued = currentEntries.filter(e => e.suggestion_status === 'pending').length;
+  readyCountEl.textContent = toReview;
+  reviewBtn.hidden = toReview === 0;
+  showSuggestBtn.hidden = !(toReview > 0 || suggestionsVisible);
+  showSuggestBtn.textContent = suggestionsVisible ? 'Hide suggestions in table' : 'Show suggestions in table';
 
-  const approvedWithSug = [...approvedDocs].filter(id => suggestions.has(id)).length;
-  approvedCountEl.textContent = approvedWithSug;
-  applyAllBtn.disabled = approvedWithSug === 0 || applyInFlight;
+  selectedCountEl.textContent = selectedDocs.size;
+  suggestBtn.disabled = selectedDocs.size === 0;
+  clearSelBtn.hidden = selectedDocs.size === 0;
+
+  const selectedWithSug = [...selectedDocs].filter(id => hasActionableUndecided(id)).length;
+  approvedCountEl.textContent = selectedWithSug;
+  applyAllBtn.hidden = selectedWithSug === 0;
+  applyAllBtn.disabled = applyInFlight;
+
+  if (entriesLoaded && !loadFailed) {
+    const sortLabel = `${COLUMN_LABEL[activeSortCol] || activeSortCol} ${activeSortDir === 'asc' ? 'lowest first' : 'highest first'}`;
+    const shown = filteredEntries.length !== currentEntries.length ? ` (${filteredEntries.length} shown)` : '';
+    statusStrip.textContent =
+      `${currentEntries.length} documents${shown} · ${toReview} to review · ${queued} queued · sorted by ${sortLabel}`;
+  }
 }
+
+selectWorstBtn.addEventListener('click', () => {
+  const candidates = sortData(
+    filteredEntries.filter(e => !e.metadata_reviewed && (e.suggestion_status || 'none') === 'none'),
+    'quality', 'asc',
+  ).slice(0, 25);
+  if (!candidates.length) { showToast('No unreviewed documents without a suggestion in the current view.'); return; }
+  candidates.forEach(e => selectedDocs.add(e.id));
+  renderTable(filteredEntries);
+  updateToolbarCounts();
+});
+
+clearSelBtn.addEventListener('click', () => {
+  selectedDocs.clear();
+  renderTable(filteredEntries);
+  updateToolbarCounts();
+});
+
+reviewBtn.addEventListener('click', () => {
+  const first = docsToReview()[0] || currentEntries.find(e => hasActionableUndecided(e.id));
+  if (!first) return;
+  if (!filteredEntries.some(e => e.id === first.id)) { activeFilters = {}; applyFilterSort(); }
+  openReviewPane(first.id);
+});
 
 // ── Generate suggestions ──────────────────────────────────────────────────────
 async function generateSuggestions() {
-  const selected = [...approvedDocs];
-  if (!selected.length) {
-    // fall back to all visible
-    const visible = filteredEntries.map(e => e.id);
-    if (!visible.length) { alert('No documents selected.'); return; }
-    visible.forEach(id => approvedDocs.add(id));
-  }
-
-  const ids = [...approvedDocs];
-  suggestBtn.textContent = 'Queuing…';
+  const ids = [...selectedDocs];
+  if (!ids.length) return;
+  if (ids.length > 25 && !confirm(`Queue ${ids.length} documents for LLM suggestions? This can take a long time. Nothing is written to Paperless until you apply a suggestion.`)) return;
+  suggestBtn.disabled = true;
 
   try {
     const resp = await fetch('/api/suggestions', {
@@ -412,18 +570,21 @@ async function generateSuggestions() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids }),
     });
-    if (!resp.ok) { alert(`Failed: ${await resp.text()}`); return; }
-    const { total } = await resp.json();
+    if (!resp.ok) { showToast(`Could not queue documents: ${await errorMessage(resp)}`, { kind: 'error' }); return; }
+    const { total, newly_added } = await resp.json();
+    showToast(`${newly_added} document(s) queued for suggestions.`);
     startPolling(total);
     cancelQueueBtn.style.display = '';
     // Mark entries as pending locally
     for (const id of ids) {
       const entry = currentEntries.find(e => e.id === id);
-      if (entry) entry.suggestion_status = 'pending';
+      if (entry && !suggestions.has(id)) entry.suggestion_status = 'pending';
     }
+    // Selection has done its job — clear it so it cannot leak into a later bulk accept
+    selectedDocs.clear();
     renderTable(filteredEntries);
   } finally {
-    suggestBtn.textContent = 'Generate suggestions';
+    updateToolbarCounts();
   }
 }
 
@@ -443,27 +604,34 @@ async function pollStatus() {
     setProgress(data.completed, data.total, data.eta_seconds, data.avg_seconds_per_doc);
     if (queuePanel.style.display !== 'none') renderQueuePanel();
 
-    // Integrate new results
-    for (const sug of data.results) {
-      if (!suggestions.has(sug.id)) {
-        suggestions.set(sug.id, sug);
-        if (!fieldStates.has(sug.id)) fieldStates.set(sug.id, {});
-        const entry = currentEntries.find(e => e.id === sug.id);
-        if (entry) {
-          entry.suggestion_status = sug.fallback_used ? 'ready' : 'ready';
-          entry.fallback_used = sug.fallback_used;
-          if (sug.title_quality != null) entry.llm_quality = sug.title_quality;
-        }
-      }
-    }
-
+    const hadBefore = suggestions.size;
+    mergeResults(data.results);
     renderTable(filteredEntries);
     updateToolbarCounts();
+    if (openPaneDocId && suggestions.size !== hadBefore) refreshPane(openPaneDocId);
 
     if (data.completed >= data.total) {
       stopPolling();
+      showToast(`Suggestions finished: ${docsToReview().length} document(s) to review.`, { kind: 'success' });
     }
   } catch (_) {}
+}
+
+// Integrate suggestion results from the server job into local state
+function mergeResults(results) {
+  for (const sug of results || []) {
+    if (suggestions.has(sug.id)) continue;
+    const entry = currentEntries.find(e => e.id === sug.id);
+    // Already applied in an earlier page session — nothing left to review
+    if (entry && entry.suggestion_status === 'done') continue;
+    suggestions.set(sug.id, sug);
+    if (!fieldStates.has(sug.id)) fieldStates.set(sug.id, {});
+    if (entry) {
+      entry.suggestion_status = 'ready';
+      entry.fallback_used = sug.fallback_used;
+      if (sug.title_quality != null) entry.llm_quality = sug.title_quality;
+    }
+  }
 }
 
 function setProgress(done, total, etaSeconds, avgSeconds) {
@@ -543,13 +711,24 @@ document.getElementById('closeQueuePanel').addEventListener('click', () => {
 cancelQueueBtn.addEventListener('click', async () => {
   stopPolling();
   await fetch('/api/suggestions/queue', { method: 'DELETE' });
+  for (const entry of currentEntries) {
+    if (entry.suggestion_status === 'pending') entry.suggestion_status = 'none';
+  }
+  renderTable(filteredEntries);
+  updateToolbarCounts();
+  showToast('Queue cancelled. Finished suggestions are kept.');
 });
 
 // ── Show suggestions toggle ───────────────────────────────────────────────────
 showSuggestBtn.addEventListener('click', () => {
   suggestionsVisible = !suggestionsVisible;
-  showSuggestBtn.textContent = (suggestionsVisible ? 'Hide suggestions (' : 'Show suggestions (') + readyCountEl.textContent + ' ready)';
   renderTable(filteredEntries);
+  updateToolbarCounts();
+  if (suggestionsVisible) {
+    // The new columns are appended on the right — bring them into view
+    const section = document.getElementById('tableSection');
+    section.scrollTo({ left: section.scrollWidth, behavior: 'smooth' });
+  }
 });
 
 // ── Inline apply / reject ─────────────────────────────────────────────────────
@@ -583,34 +762,74 @@ async function applyField(docId, field, sug) {
     item.tags_new = sug.suggested_tags.filter(t => t.is_new).map(t => t.name);
   }
 
+  const entry = currentEntries.find(e => e.id === docId);
+  const previous = entry ? { title: entry.title, correspondent: entry.correspondent, document_type: entry.document_type, tags: [...(entry.tags || [])] } : null;
+
+  if (!(await postApply([item]))) return false;
+  if (entry) applyLocally(entry, item, sug);
+  setFieldState(docId, field, 'applied');
+
+  renderTable(filteredEntries);
+  updateToolbarCounts();
+  if (openPaneDocId === docId) refreshPane(docId);
+
+  const label = COLUMN_LABEL[field] || field;
+  // Paperless cannot be told to clear a value through this API, so undo needs a previous value
+  const canUndo = previous && (field === 'tags' || previous[field]);
+  showToast(`${label} applied to Paperless.`, {
+    kind: 'success',
+    undo: canUndo ? async () => {
+      const revert = { id: docId, tags_new: [] };
+      revert[field] = previous[field];
+      if (!(await postApply([revert]))) return;
+      if (entry) entry[field] = previous[field];
+      setFieldState(docId, field, 'undecided');
+      if (entry) entry.suggestion_status = 'ready';
+      renderTable(filteredEntries);
+      updateToolbarCounts();
+      if (openPaneDocId === docId) refreshPane(docId);
+      showToast(`${label} restored.`);
+    } : null,
+  });
+  return true;
+}
+
+async function postApply(entries) {
   try {
     const resp = await fetch('/api/apply', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entries: [item] }),
+      body: JSON.stringify({ entries }),
     });
-    if (!resp.ok) { alert(`Apply failed: ${await resp.text()}`); return; }
-    setFieldState(docId, field, 'applied');
+    if (!resp.ok) { showToast(`Apply failed: ${await errorMessage(resp)}`, { kind: 'error', timeout: 0 }); return false; }
+    return true;
   } catch (err) {
-    alert(`Apply error: ${err.message}`);
-    return;
+    showToast(`Apply failed: ${err.message}`, { kind: 'error', timeout: 0 });
+    return false;
   }
+}
 
-  renderTable(filteredEntries);
-  if (openPaneDocId === docId) refreshPane(docId);
+// Mirror what /api/apply wrote, so the row and pane show the new values
+function applyLocally(entry, item, sug) {
+  if (item.title != null) entry.title = item.title;
+  if (item.correspondent != null) entry.correspondent = item.correspondent;
+  if (item.document_type != null) entry.document_type = item.document_type;
+  if (item.tags != null) {
+    const protectedLower = new Set((sug?.protected_tags || []).map(t => t.toLowerCase()));
+    const kept = (entry.tags || []).filter(t => protectedLower.has(t.toLowerCase()));
+    entry.tags = [...new Set([...kept, ...item.tags, ...(item.tags_new || [])])];
+  }
+  entry.metadata_reviewed = new Date().toISOString().slice(0, 10);
 }
 
 // ── Apply all approved ────────────────────────────────────────────────────────
 applyAllBtn.addEventListener('click', async () => {
   if (applyInFlight) return;
-  applyInFlight = true;
-  applyAllBtn.disabled = true;
-  applyAllBtn.textContent = 'Applying…';
 
   const entries = [];
-  for (const docId of approvedDocs) {
+  for (const docId of selectedDocs) {
     const sug = suggestions.get(docId);
-    if (!sug) continue;
+    if (!sug || !hasActionableUndecided(docId)) continue;
     const states = fieldStates.get(docId) || {};
     const item = { id: docId, tags_new: [] };
 
@@ -626,15 +845,17 @@ applyAllBtn.addEventListener('click', async () => {
     entries.push(item);
   }
 
-  if (!entries.length) { applyInFlight = false; applyAllBtn.disabled = false; applyAllBtn.textContent = `Apply all approved (${approvedCountEl.textContent})`; return; }
+  if (!entries.length) return;
+  const fieldCount = entries.reduce((n, item) =>
+    n + ['title', 'correspondent', 'document_type', 'tags'].filter(f => item[f] != null).length, 0);
+  if (!confirm(`Write ${fieldCount} suggested change(s) to ${entries.length} document(s) in Paperless without reviewing them one by one? This cannot be undone from here.`)) return;
+
+  applyInFlight = true;
+  applyAllBtn.disabled = true;
 
   try {
-    const resp = await fetch('/api/apply', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entries }),
-    });
-    if (!resp.ok) { alert(`Apply failed: ${await resp.text()}`); return; }
+    if (!(await postApply(entries))) return;
+    showToast(`${fieldCount} change(s) written to ${entries.length} document(s).`, { kind: 'success' });
 
     // Mark all fields applied
     for (const item of entries) {
@@ -642,12 +863,11 @@ applyAllBtn.addEventListener('click', async () => {
       if (!sug) continue;
       for (const f of relevantFields(sug)) setFieldState(item.id, f, 'applied');
     }
-    approvedDocs.clear();
+    selectedDocs.clear();
     await loadEntries();
   } finally {
     applyInFlight = false;
-    applyAllBtn.textContent = `Apply all approved (0)`;
-    applyAllBtn.disabled = true;
+    updateToolbarCounts();
   }
 });
 
@@ -658,6 +878,7 @@ function openReviewPane(docId) {
   paneBackdrop.style.display = '';
   document.body.classList.add('pane-open');
   refreshPane(docId);
+  if (!reviewPane.contains(document.activeElement)) reviewPane.focus();
 
   // Highlight row
   entryRows.querySelectorAll('tr').forEach(tr => {
@@ -678,8 +899,9 @@ function refreshPane(docId) {
     previewFrame.dataset.docId = String(docId);
     // Fetch as blob so the browser renders it inline rather than downloading
     fetch(previewUrl)
-      .then(r => r.blob())
+      .then(r => { if (!r.ok) throw new Error('preview unavailable'); return r.blob(); })
       .then(blob => {
+        if (previewFrame.dataset.docId !== String(docId)) return;  // user moved on
         const blobUrl = URL.createObjectURL(blob);
         // Revoke previous blob URL to free memory
         if (previewFrame.dataset.blobUrl) URL.revokeObjectURL(previewFrame.dataset.blobUrl);
@@ -688,6 +910,7 @@ function refreshPane(docId) {
       })
       .catch(() => { previewFrame.src = ''; });
   }
+
   document.getElementById('panePreviewLink').href = previewUrl;
   const paperlessLink = document.getElementById('panePaperlessLink');
   if (paperlessBaseUrl) {
@@ -702,6 +925,27 @@ function refreshPane(docId) {
 
   const paneFields = document.getElementById('paneFields');
   paneFields.innerHTML = '';
+
+  // Explain the state of this document before listing fields
+  const note = document.createElement('div');
+  note.className = 'pane-note';
+  const status = entry.suggestion_status || 'none';
+  if (!sug && status === 'ready') {
+    note.textContent = 'The suggestion for this document is no longer available (the server restarted or the queue was cancelled). ';
+    note.appendChild(paneGenerateButton(docId, 'Regenerate suggestion'));
+  } else if (!sug && status === 'pending') {
+    note.textContent = 'Queued — the suggestion will appear here when the LLM has processed this document.';
+  } else if (!sug) {
+    note.textContent = status === 'done' ? 'Already reviewed. ' : 'No suggestion yet. ';
+    note.appendChild(paneGenerateButton(docId, 'Generate suggestion'));
+  } else if (!hasActionableUndecided(docId)) {
+    note.classList.add('pane-note-done');
+    const left = docsToReview().length;
+    note.textContent = left
+      ? `Done with this document — ${left} more to review.`
+      : 'All done — no suggestions left to review.';
+  }
+  if (note.textContent) paneFields.appendChild(note);
 
   // Language
   if (sug?.detected_language) {
@@ -741,12 +985,13 @@ function refreshPane(docId) {
   document.getElementById('paneRejectAllBtn').style.display = hasUndecided ? '' : 'none';
 
   // Prev / Next nav buttons — show whether adjacent actionable docs exist
-  const currentIdx = filteredEntries.findIndex(e => e.id === docId);
-  const n = filteredEntries.length;
-  const hasPrev = n > 1 && filteredEntries.some((e, i) => i !== currentIdx && hasActionableUndecided(e.id));
-  const hasNext = hasPrev; // symmetric — if any other doc is actionable, both arrows are useful
-  document.getElementById('panePrevBtn').style.opacity = hasPrev ? '1' : '0.3';
-  document.getElementById('paneNextBtn').style.opacity = hasNext ? '1' : '0.3';
+  const queue = docsToReview();
+  const others = queue.some(e => e.id !== docId);
+  document.getElementById('panePrevBtn').disabled = !others;
+  document.getElementById('paneNextBtn').disabled = !others;
+  const pos = queue.findIndex(e => e.id === docId);
+  document.getElementById('panePosition').textContent =
+    pos !== -1 ? `${pos + 1} of ${queue.length} to review` : (queue.length ? `${queue.length} to review` : '');
 
   // Reasoning
   if (sug?.reasoning) {
@@ -755,6 +1000,21 @@ function refreshPane(docId) {
   } else {
     document.getElementById('paneReasoning').style.display = 'none';
   }
+}
+
+function paneGenerateButton(docId, label) {
+  const btn = document.createElement('button');
+  btn.className = 'btn-secondary';
+  btn.textContent = label;
+  btn.addEventListener('click', async () => {
+    suggestions.delete(docId);
+    fieldStates.delete(docId);
+    selectedDocs.clear();
+    selectedDocs.add(docId);
+    await generateSuggestions();
+    refreshPane(docId);
+  });
+  return btn;
 }
 
 function buildPaneField(docId, field, label, current, sugValue, state, sug) {
@@ -780,12 +1040,12 @@ function buildPaneField(docId, field, label, current, sugValue, state, sug) {
   } else if (state === 'rejected') {
     const r = document.createElement('div');
     r.className = 'pane-field-rejected';
-    r.textContent = sugValue;
+    r.textContent = `Rejected: ${sugValue}`;
     div.appendChild(r);
   } else {
     const sugRow = document.createElement('div');
     sugRow.className = 'pane-field-suggestion';
-    sugRow.innerHTML = `<span>${esc(sugValue)}</span>`;
+    sugRow.innerHTML = `<span class="sug-arrow" aria-hidden="true">→</span><span>${esc(sugValue)}</span>`;
 
     const conf = field === 'correspondent' ? sug.suggested_correspondent?.confidence
                  : field === 'document_type' ? sug.suggested_document_type?.confidence
@@ -900,10 +1160,13 @@ document.getElementById('paneApplyAllBtn').addEventListener('click', async () =>
   const sug = suggestions.get(openPaneDocId);
   if (!sug) return;
   const states = fieldStates.get(openPaneDocId) || {};
-  for (const f of relevantFields(sug)) {
-    if ((states[f] || 'undecided') === 'undecided') await applyField(openPaneDocId, f, sug);
+  const docId = openPaneDocId;
+  for (const f of actionableFields(docId, sug, currentEntries.find(e => e.id === docId))) {
+    if ((states[f] || 'undecided') === 'undecided') {
+      if (!(await applyField(docId, f, sug))) return;  // stay on this document when a write fails
+    }
   }
-  openNextDocToReview(1);
+  if (openPaneDocId === docId) advanceAfterDecision();
 });
 
 document.getElementById('paneRejectAllBtn').addEventListener('click', () => {
@@ -915,7 +1178,8 @@ document.getElementById('paneRejectAllBtn').addEventListener('click', () => {
     if ((states[f] || 'undecided') === 'undecided') setFieldState(openPaneDocId, f, 'rejected');
   }
   renderTable(filteredEntries);
-  openNextDocToReview(1);
+  updateToolbarCounts();
+  advanceAfterDecision();
 });
 
 document.getElementById('panePrevBtn').addEventListener('click', () => openNextDocToReview(-1));
@@ -955,8 +1219,8 @@ document.getElementById('tableHeaderRow').addEventListener('click', e => {
 function openDropdown(col, thEl) {
   dropdownCol = col;
   const rect = thEl.getBoundingClientRect();
-  dropdown.style.top = (rect.bottom + window.scrollY + 4) + 'px';
-  dropdown.style.left = Math.min(rect.left + window.scrollX, window.innerWidth - 280) + 'px';
+  dropdown.style.top = (rect.bottom + 4) + 'px';  // position: fixed → viewport coordinates
+  dropdown.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - 270)) + 'px';
   dropdown.style.display = '';
 
   buildDropdownFilter(col);
@@ -966,6 +1230,17 @@ function closeDropdown() {
   dropdown.style.display = 'none';
   dropdownCol = null;
 }
+
+document.querySelectorAll('#tableHeaderRow th[data-col]').forEach(th => {
+  th.tabIndex = 0;
+  th.setAttribute('aria-haspopup', 'true');
+  th.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); th.click(); }
+  });
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && dropdownCol) { e.stopPropagation(); closeDropdown(); }
+}, true);
 
 sortAscBtn.addEventListener('click', () => {
   if (!dropdownCol) return;
@@ -1093,7 +1368,7 @@ function buildDropdownFilter(col) {
       applyFilterSort();
     });
     lbl.appendChild(cb);
-    lbl.appendChild(document.createTextNode(' ' + val));
+    lbl.appendChild(document.createTextNode(' ' + (col === 'status' ? (STATUS_LABEL[val] || val) : val)));
     dropdownFilter.appendChild(lbl);
   }
 }
@@ -1110,18 +1385,19 @@ function renderFilterChips() {
   for (const [col, filter] of entries) {
     const chip = document.createElement('span');
     chip.className = 'filter-chip';
-    chip.innerHTML = `<span>${esc(col)}: ${esc(filterDescription(filter))}</span>`;
+    chip.innerHTML = `<span>${esc(COLUMN_LABEL[col] || col)}: ${esc(filterDescription(filter, col))}</span>`;
     const rm = document.createElement('button');
     rm.textContent = '×';
+    rm.setAttribute('aria-label', 'Remove filter');
     rm.addEventListener('click', () => { delete activeFilters[col]; applyFilterSort(); });
     chip.appendChild(rm);
     chipsContainer.appendChild(chip);
   }
 }
 
-function filterDescription(filter) {
+function filterDescription(filter, col) {
   if (typeof filter === 'string') return `"${filter}"`;
-  if (filter.values) return [...filter.values].join(', ');
+  if (filter.values) return [...filter.values].map(v => col === 'status' ? (STATUS_LABEL[v] || v) : v).join(', ');
   if (filter.min != null || filter.max != null) return `${filter.min ?? ''}–${filter.max ?? ''}`;
   if (filter.from || filter.to) return `${filter.from || ''}→${filter.to || ''}`;
   if (filter.neverReviewed) return 'Never reviewed';
@@ -1134,18 +1410,28 @@ clearAllFilters.addEventListener('click', () => {
 });
 
 // ── Event wiring ──────────────────────────────────────────────────────────────
-refreshBtn.addEventListener('click', loadEntries);
+refreshBtn.addEventListener('click', () => loadEntries().then(syncQueue));
 suggestBtn.addEventListener('click', generateSuggestions);
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 fetch('/api/settings').then(r => r.json()).then(s => { paperlessBaseUrl = (s.paperless_base_url || '').replace(/\/$/, ''); }).catch(() => {});
-loadEntries();
-// Reconnect to any in-progress queue (e.g. after page refresh)
-fetch('/api/suggestions/status').then(r => {
-  if (!r.ok) return;
-  return r.json();
-}).then(data => {
-  if (!data || data.completed >= data.total) return;
-  startPolling(data.total);
-  cancelQueueBtn.style.display = '';
-}).catch(() => {});
+// Restore the server-side queue after a page load: finished results are merged
+// even when the queue is complete — otherwise rows say "ready" with nothing to show.
+async function syncQueue() {
+  try {
+    const r = await fetch('/api/suggestions/status');
+    if (!r.ok) return;
+    const data = await r.json();
+    lastQueueData = data;
+    mergeResults(data.results);
+    renderTable(filteredEntries);
+    updateToolbarCounts();
+    if (data.completed < data.total) {
+      startPolling(data.total);
+      setProgress(data.completed, data.total, data.eta_seconds, data.avg_seconds_per_doc);
+      cancelQueueBtn.style.display = '';
+    }
+  } catch (_) {}
+}
+
+loadEntries().then(syncQueue);

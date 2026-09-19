@@ -31,6 +31,61 @@ const previewModal    = document.getElementById('previewModal');
 const previewPanes    = document.getElementById('previewPanes');
 const previewTitle    = document.getElementById('previewTitle');
 const closePreviewBtn = document.getElementById('closePreviewBtn');
+const cancelScanBtn   = document.getElementById('cancelScanBtn');
+const progressTrack   = document.getElementById('progressTrack');
+const dismissedNote   = document.getElementById('dismissedNote');
+
+// ── Dismissed groups ("not duplicates") — remembered in this browser ──────────
+const DISMISSED_KEY = 'paperlessCleaner.dismissedDuplicateGroups';
+function groupKey(group) {
+  return group.documents.map(d => d.id).sort((a, b) => a - b).join('-');
+}
+function loadDismissed() {
+  try { return new Set(JSON.parse(localStorage.getItem(DISMISSED_KEY) || '[]')); } catch (_) { return new Set(); }
+}
+function saveDismissed(set) {
+  try { localStorage.setItem(DISMISSED_KEY, JSON.stringify([...set])); } catch (_) {}
+}
+let dismissed = loadDismissed();
+
+function visibleGroups() {
+  return groups.filter(g => !dismissed.has(groupKey(g)));
+}
+
+function renderDismissedNote() {
+  const hiddenCount = groups.length - visibleGroups().length;
+  dismissedNote.hidden = hiddenCount === 0;
+  dismissedNote.textContent = '';
+  if (!hiddenCount) return;
+  dismissedNote.textContent = `${hiddenCount} group(s) hidden because you marked them "not duplicates". `;
+  const btn = document.createElement('button');
+  btn.className = 'chip-clear-all';
+  btn.textContent = 'Show them again';
+  btn.addEventListener('click', () => {
+    for (const g of groups) dismissed.delete(groupKey(g));
+    saveDismissed(dismissed);
+    rerenderAll();
+  });
+  dismissedNote.appendChild(btn);
+}
+
+function rerenderAll() {
+  groupsContainer.innerHTML = '';
+  groups.forEach((g, i) => renderGroup(g, i));
+  resultsSection.style.display = visibleGroups().length ? '' : 'none';
+  renderDismissedNote();
+}
+
+function summaryText(prefix) {
+  const shown = visibleGroups();
+  if (!shown.length) return `${prefix}no potential duplicates found.`;
+  const high     = shown.filter(g => g.confidence === 'high').length;
+  const medium   = shown.filter(g => g.confidence === 'medium').length;
+  const possible = shown.filter(g => g.confidence === 'possible').length;
+  return `${prefix}${shown.length} group${shown.length !== 1 ? 's' : ''}: ` +
+    [high && `${high} high confidence`, medium && `${medium} medium`, possible && `${possible} possible`]
+      .filter(Boolean).join(', ') + '.';
+}
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 fetch('/api/settings')
@@ -38,8 +93,36 @@ fetch('/api/settings')
   .then(s => { paperlessBaseUrl = (s.paperless_base_url || '').replace(/\/$/, ''); })
   .catch(() => {});
 
+// Show the previous scan right away so a visit does not force a rescan
+fetch('/api/duplicates/last')
+  .then(r => (r.ok ? r.json() : null))
+  .then(last => {
+    if (!last || activeEventSource) return;
+    groups = last.results || [];
+    rerenderAll();
+    const when = new Date(last.finished_at * 1000).toLocaleString();
+    scanSummary.style.display = '';
+    scanSummary.textContent = summaryText(`Last scan (${when}): `);
+    scanBtn.textContent = 'Scan again';
+  })
+  .catch(() => {});
+
 // ── Scan ──────────────────────────────────────────────────────────────────────
 scanBtn.addEventListener('click', runScan);
+cancelScanBtn.addEventListener('click', () => {
+  // Closing the stream makes the server stop the scan
+  if (activeEventSource) { activeEventSource.close(); activeEventSource = null; }
+  finishScanUi();
+  progressSection.style.display = 'none';
+  scanSummary.style.display = '';
+  scanSummary.textContent = summaryText('Scan cancelled — partial results: ');
+});
+
+function finishScanUi() {
+  scanBtn.disabled = false;
+  scanBtn.textContent = 'Scan again';
+  cancelScanBtn.hidden = true;
+}
 
 function runScan() {
   if (activeEventSource) { activeEventSource.close(); activeEventSource = null; }
@@ -51,6 +134,8 @@ function runScan() {
   emptyState.style.display = 'none';
   groupsContainer.innerHTML = '';
   groups = [];
+  renderDismissedNote();
+  cancelScanBtn.hidden = false;
 
   progressSection.style.display = '';
   setProgress(0, 'Connecting…', '');
@@ -60,16 +145,21 @@ function runScan() {
 
   es.addEventListener('progress', e => {
     const d = JSON.parse(e.data);
-    // Phase 1 → 0–30%, Phase 2 → 30–60%, Phase 3 → 60–95%
-    const pct = d.phase === 1 ? 15 : d.phase === 2 ? 45 : 75;
-    setProgress(pct, d.phase_label, d.detail);
+    // Phases 1–2 are quick (0–20%); phase 3 tracks the LLM group count (20–100%)
+    let pct = d.phase === 1 ? 5 : d.phase === 2 ? 15 : 20;
+    if (d.phase === 3 && d.total) pct = 20 + Math.round(80 * d.current / d.total);
+    const label = { 1: 'Step 1 of 3 — reading documents', 2: 'Step 2 of 3 — comparing text', 3: 'Step 3 of 3 — LLM check' }[d.phase] || d.phase_label;
+    setProgress(pct, label, d.detail);
   });
 
   es.addEventListener('result', e => {
     const group = JSON.parse(e.data);
     groups.push(group);
     renderGroup(group, groups.length - 1);
-    resultsSection.style.display = '';
+    if (visibleGroups().length) resultsSection.style.display = '';
+    renderDismissedNote();
+    scanSummary.style.display = '';
+    scanSummary.textContent = summaryText('So far: ');
   });
 
   es.addEventListener('done', e => {
@@ -77,49 +167,38 @@ function runScan() {
     setProgress(100, 'Complete', '');
     setTimeout(() => { progressSection.style.display = 'none'; }, 800);
 
-    scanBtn.disabled = false;
-    scanBtn.textContent = 'Scan for duplicates';
+    finishScanUi();
     activeEventSource = null;
     es.close();
 
-    if (!groups.length) {
-      emptyState.style.display = '';
-      scanSummary.style.display = '';
-      scanSummary.textContent = 'No duplicates found.';
-      return;
-    }
-    const high     = groups.filter(g => g.confidence === 'high').length;
-    const medium   = groups.filter(g => g.confidence === 'medium').length;
-    const possible = groups.filter(g => g.confidence === 'possible').length;
+    if (!visibleGroups().length) emptyState.style.display = '';
     scanSummary.style.display = '';
-    scanSummary.textContent =
-      `Found ${groups.length} group${groups.length !== 1 ? 's' : ''}: ` +
-      [high && `${high} high`, medium && `${medium} medium`, possible && `${possible} possible`]
-        .filter(Boolean).join(', ') + '.';
+    scanSummary.textContent = summaryText('Scan complete: ');
   });
 
   es.addEventListener('error', e => {
     let msg = 'Scan failed.';
     try { msg = JSON.parse(e.data).message; } catch (_) {}
-    setProgress(0, 'Error', msg);
-    scanBtn.disabled = false;
-    scanBtn.textContent = 'Scan for duplicates';
+    setProgress(0, 'Scan failed', msg);
+    finishScanUi();
     activeEventSource = null;
     es.close();
   });
 
   // SSE network error (no data event)
   es.onerror = () => {
-    if (es.readyState === EventSource.CLOSED) {
-      scanBtn.disabled = false;
-      scanBtn.textContent = 'Scan for duplicates';
-      activeEventSource = null;
-    }
+    // Never let EventSource auto-reconnect: that would silently start a second full scan
+    if (activeEventSource !== es) return;
+    es.close();
+    activeEventSource = null;
+    finishScanUi();
+    setProgress(0, 'Scan interrupted', 'The connection to the server was lost. Results so far are kept.');
   };
 }
 
 function setProgress(pct, phase, detail) {
   progressFill.style.width = pct + '%';
+  progressTrack.setAttribute('aria-valuenow', String(pct));
   progressPhase.textContent = phase;
   progressLabel.textContent = detail;
 }
@@ -139,6 +218,7 @@ function renderGroup(group, idx) {
   const card = document.createElement('div');
   card.className = 'dup-card';
   card.dataset.idx = idx;
+  if (dismissed.has(groupKey(group))) card.classList.add('is-dismissed');
 
   // ── Header ─────────────────────────────────────────────────────────────────
   const header = document.createElement('div');
@@ -167,7 +247,8 @@ function renderGroup(group, idx) {
     ${reasonSpan}
     <div class="dup-header-badges">${llmBadge}${simBadges}</div>
     <div class="dup-card-actions">
-      <button class="btn-compare" data-idx="${idx}">Side-by-side preview</button>
+      <button class="btn-compare" data-idx="${idx}">Compare side by side</button>
+      <button class="btn-secondary btn-dismiss" title="Hide this group now and in future scans (remembered in this browser)">Not duplicates</button>
     </div>
   `;
   card.appendChild(header);
@@ -197,10 +278,10 @@ function renderGroup(group, idx) {
     if (doc.is_best) tr.classList.add('dup-best-row');
     const tagsHtml = (doc.tags || []).map(t => `<span class="tag-badge">${esc(t)}</span>`).join('');
     const bestBadge = doc.is_best
-      ? '<span class="dup-best-badge" title="Highest content length + completeness — likely the keeper">★ Best</span>'
+      ? '<span class="dup-best-badge" title="Most text and most complete metadata — the copy to keep">★ Keep this one</span>'
       : '';
     const plLink = paperlessBaseUrl
-      ? `<a href="${esc(paperlessBaseUrl)}/documents/${doc.id}/details" target="_blank" rel="noopener" class="dup-open-link" title="Open in Paperless">↗</a>`
+      ? `<a href="${esc(paperlessBaseUrl)}/documents/${doc.id}/details" target="_blank" rel="noopener" class="dup-open-link">Open in Paperless ↗</a>`
       : '';
     const contentLen = doc.content_len > 0
       ? (doc.content_len >= 1000 ? Math.round(doc.content_len / 1000) + 'k' : doc.content_len)
@@ -246,10 +327,22 @@ function renderGroup(group, idx) {
     card.appendChild(details);
   }
 
+  const hint = document.createElement('div');
+  hint.className = 'dup-keep-hint';
+  hint.textContent = 'If these are duplicates: open the copy you do not want in Paperless and delete it there. This tool never deletes anything.';
+  card.appendChild(hint);
+
   groupsContainer.appendChild(card);
 
-  // Wire preview button
+  // Wire preview + dismiss buttons
   header.querySelector('.btn-compare').addEventListener('click', () => openPreview(idx));
+  header.querySelector('.btn-dismiss').addEventListener('click', () => {
+    dismissed.add(groupKey(group));
+    saveDismissed(dismissed);
+    card.classList.add('is-dismissed');
+    if (!visibleGroups().length) resultsSection.style.display = 'none';
+    renderDismissedNote();
+  });
 }
 
 // ── Side-by-side preview ──────────────────────────────────────────────────────
@@ -265,7 +358,7 @@ function openPreview(idx) {
 
     const meta = document.createElement('div');
     meta.className = 'dup-preview-meta';
-    const bestBadge = doc.is_best ? '<span class="dup-best-badge">★ Best</span> ' : '';
+    const bestBadge = doc.is_best ? '<span class="dup-best-badge">★ Keep this one</span> ' : '';
     const plHref = paperlessBaseUrl ? `${paperlessBaseUrl}/documents/${doc.id}/details` : '#';
     meta.innerHTML = `
       <div class="dup-preview-meta-title">${bestBadge}${esc(doc.title)}</div>
@@ -293,6 +386,7 @@ function openPreview(idx) {
 
   previewBackdrop.style.display = '';
   previewModal.style.display = '';
+  previewModal.focus();
   document.body.classList.add('pane-open');
 }
 

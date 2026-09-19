@@ -35,7 +35,29 @@ except ImportError:
     _ollama_client = None
 
 BASE_DIR = Path(__file__).resolve().parent
-SETTINGS_FILE = BASE_DIR / "settings.json"
+LEGACY_SETTINGS_FILE = BASE_DIR / "settings.json"
+CONFIG_DIR = Path(os.getenv("CONFIG_DIR", str(BASE_DIR.parent / "config")))
+
+
+def _resolve_settings_file() -> Path:
+    """Settings live in CONFIG_DIR (a mounted volume) so they survive container
+    recreation. Falls back to the legacy in-app location when no config dir exists."""
+    explicit = os.getenv("SETTINGS_FILE")
+    if explicit:
+        return Path(explicit)
+    if CONFIG_DIR.is_dir():
+        target = CONFIG_DIR / "settings.json"
+        if not target.exists() and LEGACY_SETTINGS_FILE.exists() and LEGACY_SETTINGS_FILE.stat().st_size > 0:
+            try:
+                target.write_text(LEGACY_SETTINGS_FILE.read_text())
+            except OSError:
+                logger.exception("Could not migrate settings to %s", target)
+                return LEGACY_SETTINGS_FILE
+        return target
+    return LEGACY_SETTINGS_FILE
+
+
+SETTINGS_FILE = _resolve_settings_file()
 
 # ---------------------------------------------------------------------------
 # Language name mapping (ISO 639-1 → English name)
@@ -236,7 +258,7 @@ def load_settings() -> AppSettings:
         raw.pop("document_state", None)  # remove legacy field if present
         return AppSettings(**{k: v for k, v in raw.items() if k in AppSettings.model_fields})
     settings = AppSettings(
-        paperless_base_url=os.getenv("PAPERLESS_BASE_URL", "http://paperless-ngx:8000"),
+        paperless_base_url=os.getenv("PAPERLESS_BASE_URL") or os.getenv("PAPERLESS_URL") or "http://paperless-ngx:8000",
         paperless_token=os.getenv("PAPERLESS_TOKEN", ""),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://ollama:11434"),
         ollama_model=os.getenv("OLLAMA_MODEL", "llama3.1"),
@@ -360,6 +382,36 @@ async def init_custom_fields(settings: AppSettings) -> None:
             client, url, headers_json, fields, "LLM quality", "integer")
         _cf_suggestion_status_id = await _resolve_or_create_field(
             client, url, headers_json, fields, "Suggestion status", "string")
+
+
+_cf_init_lock = asyncio.Lock()
+_cf_last_error: str | None = None
+
+
+def _custom_fields_ready() -> bool:
+    return None not in (_cf_metadata_reviewed_id, _cf_llm_quality_id, _cf_suggestion_status_id)
+
+
+async def ensure_custom_fields(settings: AppSettings) -> bool:
+    """Resolve the custom field IDs if startup could not (e.g. Paperless was still
+    booting). Returns False — never raises — when they are still unavailable, so
+    callers can surface a warning instead of silently showing empty review state."""
+    global _cf_last_error
+    if _custom_fields_ready():
+        return True
+    async with _cf_init_lock:
+        if _custom_fields_ready():
+            return True
+        try:
+            await init_custom_fields(settings)
+            _cf_last_error = None
+        except HTTPException as exc:
+            _cf_last_error = str(exc.detail)
+            logger.warning("Custom fields unavailable: %s", _cf_last_error)
+        except Exception as exc:
+            _cf_last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("Custom fields unavailable: %s", _cf_last_error)
+    return _custom_fields_ready()
 
 
 async def create_tag(settings: AppSettings, client: httpx.AsyncClient, name: str) -> int:
@@ -606,7 +658,11 @@ Content (first 500 chars): {content[:500]}"""
     from openai import AsyncOpenAI
 
     base = settings.ollama_base_url.rstrip("/")
-    openai_client = AsyncOpenAI(base_url=f"{base}/v1", api_key="ollama")
+    openai_client = AsyncOpenAI(
+        base_url=f"{base}/v1",
+        api_key="ollama",
+        timeout=httpx.Timeout(timeout=300.0, connect=30.0),
+    )
     client = instructor.from_openai(openai_client, mode=instructor.Mode.JSON)
 
     response: _OllamaResponse = await asyncio.wait_for(
@@ -619,7 +675,7 @@ Content (first 500 chars): {content[:500]}"""
             response_model=_OllamaResponse,
             temperature=settings.ollama_temperature,
         ),
-        timeout=60.0,
+        timeout=300.0,
     )
 
     disc = settings.confidence_discount
@@ -728,6 +784,10 @@ async def _process_one(item: dict[str, Any]) -> None:
         fallback_used = True
 
     doc_id_str = str(entry["id"])
+    if _global_job is not job:
+        # Queue was cancelled while this document was in flight — drop the result
+        _transient_status.pop(doc_id_str, None)
+        return
     _transient_status[doc_id_str] = "ready"
     _transient_fallback[doc_id_str] = fallback_used
 
@@ -772,10 +832,8 @@ async def _worker() -> None:
 async def _startup() -> None:
     global _worker_task
     settings = load_settings()
-    try:
-        await init_custom_fields(settings)
-    except Exception:
-        logger.exception("Failed to initialise Paperless custom fields — will retry on first use")
+    if not await ensure_custom_fields(settings):
+        logger.warning("Paperless custom fields not resolved at startup — retrying on each request until they are")
     _worker_task = asyncio.create_task(_worker())
 
 
@@ -827,23 +885,79 @@ async def update_settings(payload: SettingsRequest) -> dict[str, Any]:
         data["paperless_token"] = current.paperless_token
     new_settings = AppSettings(**data)
     save_settings(new_settings)
-    # Re-initialise custom fields in case the Paperless URL changed
+    # Re-resolve custom fields in case the Paperless URL changed
+    global _cf_metadata_reviewed_id, _cf_llm_quality_id, _cf_suggestion_status_id
+    _cf_metadata_reviewed_id = _cf_llm_quality_id = _cf_suggestion_status_id = None
+    fields_ok = await ensure_custom_fields(new_settings)
+    return {"status": "ok", "paperless_ok": fields_ok, "paperless_error": None if fields_ok else _cf_last_error}
+
+
+class ConnectionTestRequest(BaseModel):
+    paperless_base_url: str = ""
+    paperless_token: str = ""
+    ollama_base_url: str = ""
+    ollama_model: str = ""
+
+
+@app.post("/api/settings/test")
+async def test_connections(payload: ConnectionTestRequest) -> dict[str, Any]:
+    """Check the *submitted* (possibly unsaved) connection values."""
+    current = load_settings()
+    token = current.paperless_token if payload.paperless_token == "***" else payload.paperless_token
+    out: dict[str, Any] = {}
+
     try:
-        await init_custom_fields(new_settings)
-    except Exception:
-        logger.exception("Failed to re-initialise custom fields after settings update")
-    return {"status": "ok"}
+        url = f"{payload.paperless_base_url.rstrip('/')}/api/documents/?page_size=1"
+        headers = {"Authorization": f"Token {token}"} if token else {}
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
+        if resp.status_code in (401, 403):
+            out["paperless"] = {"ok": False, "message": "Paperless rejected the API token."}
+        elif resp.status_code >= 400:
+            out["paperless"] = {"ok": False, "message": f"Paperless answered HTTP {resp.status_code}."}
+        else:
+            out["paperless"] = {"ok": True, "message": f"Connected — {resp.json().get('count', '?')} documents."}
+    except Exception as exc:
+        out["paperless"] = {"ok": False, "message": f"Could not reach Paperless ({type(exc).__name__})."}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            resp = await client.get(f"{payload.ollama_base_url.rstrip('/')}/api/tags")
+        if resp.status_code >= 400:
+            out["ollama"] = {"ok": False, "message": f"Ollama answered HTTP {resp.status_code}."}
+        else:
+            models = [m.get("name", "") for m in resp.json().get("models", [])]
+            wanted = payload.ollama_model
+            found = any(m == wanted or m.split(":")[0] == wanted for m in models)
+            out["ollama"] = {
+                "ok": found,
+                "message": f"Connected — model '{wanted}' available." if found
+                else f"Connected, but model '{wanted}' is not installed.",
+            }
+    except Exception as exc:
+        out["ollama"] = {"ok": False, "message": f"Could not reach Ollama ({type(exc).__name__})."}
+
+    return out
 
 
 @app.get("/api/entries")
-async def entries(sort_by: str = Query("name", pattern="^(name|tags|quality)$")) -> list[dict[str, Any]]:
+async def entries(sort_by: str = Query("name", pattern="^(name|tags|quality)$")) -> dict[str, Any]:
     settings = load_settings()
-    tag_map, corr_map, dtype_map, docs = await asyncio.gather(
-        get_tag_map(settings),
-        get_correspondent_map(settings),
-        get_document_type_map(settings),
-        get_documents(settings),
-    )
+    if not settings.paperless_token:
+        raise HTTPException(status_code=503, detail="No Paperless API token configured. Add one in Settings.")
+    review_state_ok = await ensure_custom_fields(settings)
+    try:
+        tag_map, corr_map, dtype_map, docs = await asyncio.gather(
+            get_tag_map(settings),
+            get_correspondent_map(settings),
+            get_document_type_map(settings),
+            get_documents(settings),
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not reach Paperless at {settings.paperless_base_url} ({type(exc).__name__}).",
+        )
 
     enriched = []
     for d in docs:
@@ -898,13 +1012,20 @@ async def entries(sort_by: str = Query("name", pattern="^(name|tags|quality)$"))
             x["llm_quality"] if x["llm_quality"] is not None else x["heuristic_quality"]
         ))
 
-    return enriched
+    warnings: list[str] = []
+    if not review_state_ok:
+        warnings.append(
+            "Review state could not be read from Paperless, so every document shows as "
+            f"not reviewed. ({_cf_last_error or 'custom fields unavailable'})"
+        )
+    return {"entries": enriched, "review_state_ok": review_state_ok, "warnings": warnings}
 
 
 @app.post("/api/suggestions")
 async def suggestions(payload: SuggestRequest) -> dict[str, Any]:
     global _global_job
     settings = load_settings()
+    await ensure_custom_fields(settings)
     tag_objects, corr_map, dtype_map, docs = await asyncio.gather(
         get_tag_objects(settings),
         get_correspondent_map(settings),
@@ -999,6 +1120,8 @@ async def cancel_queue() -> dict[str, Any]:
         except asyncio.QueueEmpty:
             break
     _global_job = None
+    for doc_id_str in [k for k, v in _transient_status.items() if v == "pending"]:
+        _transient_status.pop(doc_id_str, None)
     return {"status": "ok", "cancelled": cancelled}
 
 
@@ -1023,8 +1146,11 @@ async def apply_changes(payload: ApplyRequest) -> dict[str, Any]:
         tag_id_is_manual = {t["id"]: (t.get("matching_algorithm", 0) == 0) for t in tag_objects}
 
         # Ensure custom fields are initialised (may not be if startup failed)
-        if _cf_metadata_reviewed_id is None:
-            await init_custom_fields(settings)
+        if not await ensure_custom_fields(settings):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Cannot record review state in Paperless: {_cf_last_error or 'custom fields unavailable'}",
+            )
 
         for entry in payload.entries:
             patch: dict[str, Any] = {}
@@ -1115,6 +1241,65 @@ def _content_similarity(a: str, b: str, sample: int = 800) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
+# Last completed duplicate scan (in memory) so revisiting the page needs no rescan
+_last_duplicate_scan: dict[str, Any] | None = None
+
+
+def _duplicate_result(g: dict[str, Any]) -> dict[str, Any] | None:
+    """Final confidence for a candidate group; None when the LLM ruled it out.
+
+    High     → content nearly identical (≥ 0.85) OR LLM says duplicate
+    Medium   → ambiguous (0.35–0.85) and LLM inconclusive
+    Possible → metadata match only, or LLM says same template
+    """
+    sim = g["max_similarity"]
+    llm_verdict = g.get("llm_verdict")
+    if llm_verdict == "different":
+        return None
+    if sim >= 0.85 or llm_verdict == "duplicate":
+        confidence = "high"
+    elif 0.35 <= sim < 0.85 and llm_verdict == "same_template":
+        confidence = "possible"
+    elif sim >= 0.35:
+        confidence = "medium"
+    else:
+        confidence = "possible"
+
+    docs_in = g["docs"]
+    best_id = max(docs_in, key=lambda e: (e["content_len"], e["completeness"], e["heuristic_quality"]))["id"]
+    return {
+        "confidence": confidence,
+        "reason": g["meta_reason"],
+        "llm_verdict": llm_verdict,
+        "llm_reasoning": g.get("llm_reasoning", ""),
+        "pairs": g["pairs"],
+        "best_id": best_id,
+        "snippets": {e["id"]: e["content"][:400] for e in docs_in},
+        "documents": [
+            {
+                "id": e["id"],
+                "title": e["title"],
+                "correspondent": e["correspondent"],
+                "document_type": e["document_type"],
+                "date": e["date"],
+                "tags": e["tags"],
+                "heuristic_quality": e["heuristic_quality"],
+                "completeness": e["completeness"],
+                "content_len": e["content_len"],
+                "is_best": e["id"] == best_id,
+            }
+            for e in docs_in
+        ],
+    }
+
+
+@app.get("/api/duplicates/last")
+async def last_duplicate_scan() -> dict[str, Any]:
+    if _last_duplicate_scan is None:
+        raise HTTPException(status_code=404, detail="No scan has been run yet")
+    return _last_duplicate_scan
+
+
 def _sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
@@ -1125,7 +1310,7 @@ async def duplicates_page(request: Request) -> HTMLResponse:
 
 
 @app.get("/api/duplicates/scan")
-async def scan_duplicates() -> StreamingResponse:
+async def scan_duplicates(request: Request) -> StreamingResponse:
     """
     Three-pass duplicate scan streamed as SSE events.
 
@@ -1248,15 +1433,30 @@ async def scan_duplicates() -> StreamingResponse:
                 # Max similarity across all pairs in the group
                 g["max_similarity"] = max((p["similarity"] for p in pairs), default=0.0)
 
-            # ── Phase 3: LLM review for ambiguous pairs (sim 0.35–0.85) ────────
+            # ── Emit groups that need no LLM right away ───────────────────────
             ambiguous = [g for g in raw_groups if 0.35 <= g["max_similarity"] < 0.85]
+            emitted: list[dict[str, Any]] = []
+            for g in raw_groups:
+                if 0.35 <= g["max_similarity"] < 0.85:
+                    continue
+                result = _duplicate_result(g)
+                if result:
+                    emitted.append(result)
+                    yield _sse("result", result)
+
+            # ── Phase 3: LLM review for ambiguous pairs (sim 0.35–0.85) ────────
             yield _sse("progress", {
                 "phase": 3,
                 "phase_label": "Phase 3/3",
+                "current": 0,
+                "total": len(ambiguous),
                 "detail": f"LLM reviewing {len(ambiguous)} ambiguous group(s)…" if ambiguous else "No ambiguous groups — skipping LLM.",
             })
 
             for idx, g in enumerate(ambiguous):
+                if await request.is_disconnected():
+                    logger.info("Duplicate scan cancelled by client after %d/%d LLM reviews", idx, len(ambiguous))
+                    return
                 docs_in = g["docs"]
                 # Build snippet pairs for LLM — use first 300 chars of each doc
                 snippets_for_llm = [
@@ -1286,7 +1486,11 @@ No text outside the JSON."""
                 try:
                     from openai import AsyncOpenAI
                     base = settings.ollama_base_url.rstrip("/")
-                    openai_client = AsyncOpenAI(base_url=f"{base}/v1", api_key="ollama")
+                    openai_client = AsyncOpenAI(
+                        base_url=f"{base}/v1",
+                        api_key="ollama",
+                        timeout=httpx.Timeout(timeout=300.0, connect=30.0),
+                    )
                     llm_client = instructor.from_openai(openai_client, mode=instructor.Mode.JSON)
 
                     class _LLMVerdict(BaseModel):
@@ -1303,7 +1507,7 @@ No text outside the JSON."""
                             response_model=_LLMVerdict,
                             temperature=0.0,
                         ),
-                        timeout=60.0,
+                        timeout=300.0,
                     )
                     llm_verdict = resp.verdict if resp.verdict in ("duplicate", "same_template", "different") else "unknown"
                     llm_reasoning = resp.reasoning
@@ -1314,65 +1518,23 @@ No text outside the JSON."""
                 g["llm_verdict"] = llm_verdict
                 g["llm_reasoning"] = llm_reasoning
 
+                # Emit as soon as this group is decided
+                result = _duplicate_result(g)
+                if result:
+                    emitted.append(result)
+                    yield _sse("result", result)
+
                 yield _sse("progress", {
                     "phase": 3,
                     "phase_label": "Phase 3/3",
-                    "detail": f"LLM reviewed group {idx + 1}/{len(ambiguous)}: {llm_verdict}",
+                    "current": idx + 1,
+                    "total": len(ambiguous),
+                    "detail": f"LLM reviewed group {idx + 1} of {len(ambiguous)}",
                 })
 
-            # ── Assign final confidence & emit results ─────────────────────────
-            total_emitted = 0
-            for g in raw_groups:
-                sim = g["max_similarity"]
-                llm_verdict = g.get("llm_verdict")
-
-                # Confidence logic:
-                # High   → content nearly identical (≥ 0.85) OR ambiguous but LLM says duplicate
-                # Medium → ambiguous (0.35–0.85) and LLM is unknown/same_template, OR metadata match with low sim
-                # Possible → low content sim, metadata match only
-                # Drop   → LLM says "different"
-                if llm_verdict == "different":
-                    continue  # discard — LLM ruled it out
-                if sim >= 0.85:
-                    confidence = "high"
-                elif llm_verdict == "duplicate":
-                    confidence = "high"
-                elif 0.35 <= sim < 0.85 and llm_verdict == "same_template":
-                    confidence = "possible"
-                elif sim >= 0.35:
-                    confidence = "medium"
-                else:
-                    confidence = "possible"
-
-                docs_in = g["docs"]
-                best_id = max(docs_in, key=lambda e: (e["content_len"], e["completeness"], e["heuristic_quality"]))["id"]
-                snippets_out = {e["id"]: e["content"][:400] for e in docs_in}
-
-                yield _sse("result", {
-                    "confidence": confidence,
-                    "reason": g["meta_reason"],
-                    "llm_verdict": llm_verdict,
-                    "llm_reasoning": g.get("llm_reasoning", ""),
-                    "pairs": g["pairs"],
-                    "best_id": best_id,
-                    "snippets": snippets_out,
-                    "documents": [
-                        {
-                            "id": e["id"],
-                            "title": e["title"],
-                            "correspondent": e["correspondent"],
-                            "document_type": e["document_type"],
-                            "date": e["date"],
-                            "tags": e["tags"],
-                            "heuristic_quality": e["heuristic_quality"],
-                            "completeness": e["completeness"],
-                            "content_len": e["content_len"],
-                            "is_best": e["id"] == best_id,
-                        }
-                        for e in docs_in
-                    ],
-                })
-                total_emitted += 1
+            global _last_duplicate_scan
+            _last_duplicate_scan = {"finished_at": time.time(), "results": emitted}
+            total_emitted = len(emitted)
 
             yield _sse("done", {"total": total_emitted})
 

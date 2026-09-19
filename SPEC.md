@@ -17,7 +17,7 @@ Browser  ←→  FastAPI (internal port 8080, exposed as 8200)  ←→  Paperles
                                                              ←→  Ollama API (optional)
 ```
 
-- **Backend**: Python / FastAPI. State: `app/settings.json` (connection config only). All document data lives in Paperless-NGX, including quality scores and suggestion status (stored as custom fields).
+- **Backend**: Python / FastAPI. State: `config/settings.json` (connection config only; legacy location `app/settings.json` is migrated automatically). All document data lives in Paperless-NGX, including quality scores and suggestion status (stored as custom fields).
 - **Frontend**: Vanilla HTML/CSS/JavaScript. Two pages: main (`/`) and settings (`/settings`).
 - **No local database**. All document state is fetched live from Paperless-NGX.
 - **Docker Compose** for deployment. Single service; host port `8200`, container port `8080`.
@@ -28,7 +28,7 @@ Browser  ←→  FastAPI (internal port 8080, exposed as 8200)  ←→  Paperles
 
 ### 3.1 Settings
 
-Persisted in `app/settings.json`. Seeded from environment variables on first run if the file is empty.
+Persisted in `config/settings.json` (`CONFIG_DIR`, default `/app/config`; override the file with `SETTINGS_FILE`). Seeded from environment variables on first run if the file is empty. `PAPERLESS_URL` is accepted as an alias for `PAPERLESS_BASE_URL`.
 
 | Field | Type | Default | Env var |
 |---|---|---|---|
@@ -141,16 +141,25 @@ Returns the settings page (HTML).
 Returns current settings. `paperless_token` is masked as `"***"`.
 
 ### 4.4 `POST /api/settings`
-Saves settings to `app/settings.json`. Token is only updated if the submitted value is not `"***"`.
+Saves settings to `config/settings.json`. Token is only updated if the submitted value is not `"***"`. Re-resolves the Paperless custom fields with the new connection.
 
-**Response**: `{ "status": "ok" }`
+**Response**: `{ "status": "ok", "paperless_ok": true, "paperless_error": null }`
+
+### 4.4a `POST /api/settings/test`
+Checks the submitted (possibly unsaved) connection values without saving them. Token `"***"` means "use the stored token".
+
+**Request body**: `{ "paperless_base_url", "paperless_token", "ollama_base_url", "ollama_model" }`
+
+**Response**: `{ "paperless": { "ok": bool, "message": str }, "ollama": { "ok": bool, "message": str } }`
 
 ### 4.5 `GET /api/entries`
-Fetches all documents from Paperless-NGX, resolves tag/correspondent/document_type IDs to names, reads custom field values, computes quality scores, overlays transient in-memory status, and returns an array of Entry objects.
+Fetches all documents from Paperless-NGX, resolves tag/correspondent/document_type IDs to names, reads custom field values, computes quality scores, and overlays transient in-memory status.
 
-**Response**: array of Entry objects (§3.2).
+Custom field IDs are resolved lazily: if they could not be resolved at startup (e.g. Paperless was still booting), every request retries until they are. While they are unresolved the documents are still returned, but `review_state_ok` is `false` and `warnings` explains that review state is unknown — the UI shows this as a banner rather than presenting every document as unreviewed.
 
-**Error**: `502` if Paperless-NGX is unreachable.
+**Response**: `{ "entries": [Entry (§3.2)], "review_state_ok": bool, "warnings": [str] }`
+
+**Errors**: `502` if Paperless-NGX is unreachable, `503` if no API token is configured. `detail` is a human-readable sentence.
 
 ### 4.6 `POST /api/suggestions`
 Adds document IDs to the global suggestion queue. Deduplicates — IDs already in the queue are skipped.
@@ -340,7 +349,7 @@ Local, offline. Capitalises each word, replaces underscores with spaces. Does no
 │  Paperless Cleaner                            [?] [Settings] │
 ├─────────────────────────────────────────────────────────────┤
 │  [Refresh] [Generate suggestions] [Show suggestions (N)]    │
-│  [Apply all approved (N)]  [Cancel queue]                   │
+│  [Accept all suggestions for N selected]  [Cancel queue]    │
 ├─────────────────────────────────────────────────────────────┤
 │  ████████░░░░  Processing 3 of 5 · ~14 s/doc · ETA 28 s    │
 ├─────────────────────────────────────────────────────────────┤
@@ -475,12 +484,13 @@ Form with two sections: Paperless-NGX connection and suggestion provider config.
 
 - Docker image based on `python:3.12-slim`.
 - Host port `8200`, container port `8080`.
-- `app/settings.json` bind-mounted from host. Must be created (`touch app/settings.json`) before first `docker compose up`.
+- `./config` bind-mounted at `/app/config`; holds `settings.json`. Any deployment must mount a volume there or settings are lost on container recreation.
+- When run in the same Compose project as Paperless-NGX, add `depends_on: paperless-ngx: condition: service_healthy`. The app also recovers on its own if Paperless comes up later.
 - `stop_grace_period: 70s` — allows in-flight Ollama requests (60 s timeout) to be cancelled before Docker sends SIGKILL.
 - `restart: unless-stopped`.
 
 **What persists across restarts:**
-- Settings (`app/settings.json`)
+- Settings (`config/settings.json`)
 - LLM quality scores, suggestion status `"done"`, and review dates (Paperless custom fields)
 
 **What does not persist:**

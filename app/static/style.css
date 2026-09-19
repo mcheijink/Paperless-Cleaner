@@ -15,6 +15,8 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
+:focus-visible { outline: 2px solid #60a5fa; outline-offset: 1px; }
 
 body {
   margin: 0;
@@ -41,6 +43,64 @@ main {
   display: grid;
   gap: 0.75rem;
 }
+main > * { min-width: 0; }  /* let wide tables scroll inside their own container */
+
+header nav { flex-wrap: wrap; }
+.btn-help {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 0.2rem 0.6rem;
+}
+.btn-help:hover:not(:disabled) { background: var(--border); color: var(--text); }
+
+/* ── Status strip, banners, page intro ───────────────────────────────────── */
+.status-strip { font-size: 0.88rem; color: var(--text-muted); }
+.page-intro { margin: 0; color: var(--text-muted); max-width: 70ch; line-height: 1.5; }
+.banner {
+  border-radius: 0.4rem;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+.banner-warning { background: #78350f; border: 1px solid #d97706; color: #fde68a; }
+.error-text { color: #f87171; }
+.table-message td {
+  white-space: normal;
+  max-width: none;
+  padding: 1.5rem 0.8rem;
+  color: var(--text-muted);
+}
+.table-message button, .table-message a { margin-left: 0.6rem; }
+
+/* ── Toasts ──────────────────────────────────────────────────────────────── */
+.toast-host {
+  position: fixed;
+  left: 50%;
+  bottom: 1rem;
+  transform: translateX(-50%);
+  z-index: 2000;
+  display: grid;
+  gap: 0.4rem;
+  width: min(480px, calc(100vw - 2rem));
+}
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  background: #0b1220;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 0.4rem;
+  padding: 0.55rem 0.7rem;
+  font-size: 0.86rem;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+}
+.toast span { flex: 1; }
+.toast-success { border-left-color: var(--success); }
+.toast-error { border-left-color: var(--danger); }
+.toast-undo { background: transparent; color: #93c5fd; border: 1px solid #93c5fd66; padding: 0.2rem 0.6rem; }
+.toast-close { background: transparent; color: var(--text-muted); padding: 0 0.3rem; font-size: 1rem; }
 
 /* ── Toolbar ─────────────────────────────────────────────────────────────── */
 .toolbar {
@@ -230,19 +290,25 @@ tr.row-selected td { background: rgba(37,99,235,0.12); }
 
 .col-check { width: 32px; max-width: 32px; }
 
-/* ── Status dot ──────────────────────────────────────────────────────────── */
-.status-dot {
+/* ── Status badge ────────────────────────────────────────────────────────── */
+.status-badge {
   display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  vertical-align: middle;
+  font-size: 0.74rem;
+  border-radius: 0.3rem;
+  padding: 0.08rem 0.45rem;
+  border: 1px solid transparent;
+  white-space: nowrap;
 }
-.status-none    { background: #6b7280; }
-.status-pending { background: #f59e0b; }
-.status-ready   { background: #22c55e; }
-.status-done    { background: #3b82f6; }
-.status-fallback { background: #f97316; }
+.status-none     { color: var(--text-muted); border-color: var(--border); }
+.status-pending  { background: #78350f; color: #fcd34d; }
+.status-ready    { background: #052e16; color: #4ade80; border-color: #16a34a66; }
+.status-done     { background: #1e3a5f; color: #93c5fd; }
+.status-fallback { background: #7c2d12; color: #fdba74; }
+.quality-heuristic { color: var(--text-muted); }
+
+tbody tr[tabindex] { cursor: pointer; }
+th[data-col] { cursor: pointer; }
+th[data-col]:hover, th[data-col]:focus-visible { color: var(--text); }
 
 /* ── Suggestion columns ──────────────────────────────────────────────────── */
 .sug-cell {
@@ -451,6 +517,18 @@ tr.row-selected td { background: rgba(37,99,235,0.12); }
 .pane-field-applied { color: #4ade80; font-size: 0.82rem; }
 .pane-field-applied::before { content: '✓ Applied'; }
 .pane-field-rejected { color: var(--text-muted); font-size: 0.82rem; text-decoration: line-through; }
+.sug-arrow { color: var(--text-muted); }
+.pane-position { font-size: 0.8rem; color: var(--text-muted); align-self: center; margin-right: 0.4rem; white-space: nowrap; }
+.pane-note {
+  font-size: 0.85rem;
+  line-height: 1.5;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  padding: 0.55rem 0.7rem;
+}
+.pane-note button { margin-left: 0.4rem; }
+.pane-note-done { border-color: #16a34a66; color: #4ade80; }
 
 .lang-label {
   font-size: 0.76rem;
@@ -859,4 +937,46 @@ kbd {
   max-height: 160px;
   overflow-y: auto;
   margin: 0;
+}
+
+/* ── Settings extras ─────────────────────────────────────────────────────── */
+.test-row { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+.test-result { font-size: 0.84rem; }
+.test-result.ok { color: #4ade80; }
+.test-result.fail { color: #f87171; }
+.form-status { font-size: 0.86rem; }
+.form-status.ok { color: #4ade80; }
+.form-status.fail { color: #f87171; }
+fieldset:disabled, label.is-disabled { opacity: 0.5; }
+
+/* ── Duplicates extras ───────────────────────────────────────────────────── */
+#progressSection.progress-stacked { display: grid; gap: 0.3rem; }
+.progress-row { display: flex; align-items: center; gap: 0.6rem; }
+.progress-row .progress-bar-track { cursor: default; }
+.dup-card.is-dismissed { display: none; }
+.dup-keep-hint { font-size: 0.78rem; color: var(--text-muted); padding: 0.45rem 0.85rem; border-top: 1px solid var(--border); }
+.dismissed-note { font-size: 0.84rem; color: var(--text-muted); }
+
+/* ── Narrow screens ──────────────────────────────────────────────────────── */
+@media (max-width: 720px) {
+  header { flex-direction: column; align-items: flex-start; gap: 0.5rem; padding: 0.75rem 1rem; }
+  main { padding: 0.75rem 1rem; }
+  .toolbar button { flex: 1 1 auto; }
+
+  .review-pane, .dup-preview-modal {
+    inset: 0;
+    top: 0; left: 0;
+    transform: none;
+    width: 100vw;
+    height: 100dvh;
+    border-radius: 0;
+    border: none;
+  }
+  .pane-body, .dup-preview-panes { flex-direction: column; overflow-y: auto; }
+  .pane-left { flex: 0 0 auto; border-right: none; border-bottom: 1px solid var(--border); overflow: visible; }
+  .pane-right { flex: 0 0 70vh; }
+  .dup-preview-pane { flex: 0 0 80vh; border-right: none; border-bottom: 1px solid var(--border); }
+  .pane-shortcuts { display: none; }
+  .dup-snippet-grid { flex-direction: column; }
+  .dup-card { overflow-x: auto; }
 }

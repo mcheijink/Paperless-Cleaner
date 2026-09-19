@@ -1,0 +1,11 @@
+.git
+.github
+.venv
+.claude
+__pycache__
+*.pyc
+graphify-out
+data
+config
+# never bake local settings (API token) into an image
+app/settings.json
