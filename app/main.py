@@ -502,6 +502,35 @@ def detect_language(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# LLM input / request options
+# ---------------------------------------------------------------------------
+
+# How much document text the LLM sees. Prompt processing on the GPU is cheap
+# (~4k tokens/s on an RTX 4070), so we send the whole text up to this cap
+# (~8k tokens; covers ~94% of documents). Must stay well under the Ollama
+# context length, or Ollama silently drops the start of the prompt.
+LLM_MAX_CONTENT_CHARS = int(os.getenv("LLM_MAX_CONTENT_CHARS", "24000"))
+LLM_DUPLICATE_SNIPPET_CHARS = int(os.getenv("LLM_DUPLICATE_SNIPPET_CHARS", "3000"))
+
+# Thinking models (qwen3.x, deepseek-r1) ignore the "/no_think" prompt prefix on
+# Ollama's OpenAI-compatible endpoint and reason for thousands of tokens first
+# (qwen3.5:9b: ~6000 tokens, ~90 s per document instead of ~3 s).
+# reasoning_effort="none" switches thinking off there; non-thinking models
+# accept and ignore it.
+LLM_EXTRA_BODY = {"reasoning_effort": "none"}
+
+
+def content_for_llm(text: str, limit: int = LLM_MAX_CONTENT_CHARS) -> str:
+    """Return the document text, or its start and end when longer than limit."""
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 3
+    tail = limit - head
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n\n[... {omitted} characters omitted ...]\n\n{text[-tail:]}"
+
+
+# ---------------------------------------------------------------------------
 # Suggestion providers
 # ---------------------------------------------------------------------------
 
@@ -653,7 +682,8 @@ Document type: {current_dtype}
 Date: {doc_date}
 Current auto-matched tags: {", ".join(current_auto_tags) or "none"}
 Protected workflow tags (do not touch): {", ".join(current_manual_tags) or "none"}
-Content (first 500 chars): {content[:500]}"""
+Content:
+{content_for_llm(content)}"""
 
     from openai import AsyncOpenAI
 
@@ -674,6 +704,7 @@ Content (first 500 chars): {content[:500]}"""
             ],
             response_model=_OllamaResponse,
             temperature=settings.ollama_temperature,
+            extra_body=LLM_EXTRA_BODY,
         ),
         timeout=300.0,
     )
@@ -1458,9 +1489,10 @@ async def scan_duplicates(request: Request) -> StreamingResponse:
                     logger.info("Duplicate scan cancelled by client after %d/%d LLM reviews", idx, len(ambiguous))
                     return
                 docs_in = g["docs"]
-                # Build snippet pairs for LLM — use first 300 chars of each doc
+                # Build snippet pairs for LLM
                 snippets_for_llm = [
-                    {"id": e["id"], "title": e["title"], "snippet": e["content"][:300]}
+                    {"id": e["id"], "title": e["title"],
+                     "snippet": content_for_llm(e["content"], LLM_DUPLICATE_SNIPPET_CHARS)}
                     for e in docs_in
                 ]
                 snippet_text = "\n\n".join(
@@ -1506,6 +1538,7 @@ No text outside the JSON."""
                             ],
                             response_model=_LLMVerdict,
                             temperature=0.0,
+                            extra_body=LLM_EXTRA_BODY,
                         ),
                         timeout=300.0,
                     )
