@@ -606,7 +606,10 @@ async function pollStatus() {
 
     const hadBefore = suggestions.size;
     mergeResults(data.results);
-    renderTable(filteredEntries);
+    // New results change suggestion_status; re-run the active filters so that
+    // e.g. a "Suggestion ready" filter picks up documents as they finish.
+    if (suggestions.size !== hadBefore) applyFilterSort();
+    else renderTable(filteredEntries);
     updateToolbarCounts();
     if (openPaneDocId && suggestions.size !== hadBefore) refreshPane(openPaneDocId);
 

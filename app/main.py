@@ -502,6 +502,33 @@ def detect_language(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Custom field writes
+# ---------------------------------------------------------------------------
+
+async def merged_custom_fields(
+    client: httpx.AsyncClient, settings: AppSettings, doc_id: int, updates: dict[int, Any],
+) -> list[dict[str, Any]]:
+    """Return the document's complete custom_fields list with `updates` applied.
+
+    Paperless treats `custom_fields` in a document PATCH as the complete set:
+    every field left out is DELETED from the document. Sending only the fields
+    this tool manages wiped user fields such as "Status Rekening" (and a
+    Paperless workflow then re-added them as "--"). Always PATCH the merged
+    list returned here. Raises if the current fields cannot be read, so a
+    failed read never turns into a blind overwrite.
+    """
+    url = f"{settings.paperless_base_url.rstrip('/')}/api/documents/{doc_id}/"
+    resp = await client.get(url, headers=_auth_headers(settings), params={"fields": "id,custom_fields"})
+    resp.raise_for_status()
+    current = resp.json().get("custom_fields")
+    if current is None:
+        raise RuntimeError(f"Paperless returned no custom_fields for document {doc_id}")
+    merged: dict[int, Any] = {cf["field"]: cf["value"] for cf in current}
+    merged.update(updates)
+    return [{"field": field, "value": value} for field, value in merged.items()]
+
+
+# ---------------------------------------------------------------------------
 # LLM input / request options
 # ---------------------------------------------------------------------------
 
@@ -833,9 +860,11 @@ async def _process_one(item: dict[str, Any]) -> None:
             patch_url = f"{settings_fresh.paperless_base_url.rstrip('/')}/api/documents/{entry['id']}/"
             headers = {**_auth_headers(settings_fresh), "Content-Type": "application/json"}
             async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                await client.patch(patch_url, headers=headers, json={
-                    "custom_fields": [{"field": _cf_llm_quality_id, "value": suggestion.title_quality}]
-                })
+                fields = await merged_custom_fields(
+                    client, settings_fresh, entry["id"], {_cf_llm_quality_id: suggestion.title_quality},
+                )
+                resp = await client.patch(patch_url, headers=headers, json={"custom_fields": fields})
+                resp.raise_for_status()
         except Exception:
             logger.exception("Failed to persist llm_quality for doc %s", entry["id"])
 
@@ -1224,13 +1253,15 @@ async def apply_changes(payload: ApplyRequest) -> dict[str, Any]:
                         tag_ids.append(inverse_tag_map[new_tag.lower()])
                 patch["tags"] = tag_ids
 
-            custom_fields_patch = []
+            custom_field_updates: dict[int, Any] = {}
             if _cf_metadata_reviewed_id is not None:
-                custom_fields_patch.append({"field": _cf_metadata_reviewed_id, "value": today})
+                custom_field_updates[_cf_metadata_reviewed_id] = today
             if _cf_suggestion_status_id is not None:
-                custom_fields_patch.append({"field": _cf_suggestion_status_id, "value": "done"})
-            if custom_fields_patch:
-                patch["custom_fields"] = custom_fields_patch
+                custom_field_updates[_cf_suggestion_status_id] = "done"
+            if custom_field_updates:
+                patch["custom_fields"] = await merged_custom_fields(
+                    client, settings, entry.id, custom_field_updates,
+                )
 
             url = f"{settings.paperless_base_url.rstrip('/')}/api/documents/{entry.id}/"
             resp = await client.patch(url, headers=headers_json, json=patch)
