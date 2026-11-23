@@ -980,3 +980,7 @@ fieldset:disabled, label.is-disabled { opacity: 0.5; }
   .dup-snippet-grid { flex-direction: column; }
   .dup-card { overflow-x: auto; }
 }
+
+/* Duplicates: high-confidence filter and LLM explanation */
+.dup-filter-toggle { display: inline-flex; align-items: center; gap: .4rem; font-size: .9rem; white-space: nowrap; }
+.dup-llm-reasoning { margin: .25rem 0 .5rem; font-size: .9rem; color: var(--text-muted); font-style: italic; }

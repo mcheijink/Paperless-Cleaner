@@ -22,6 +22,8 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 
+from app import duplicates as dup
+
 try:
     from langdetect import detect as _langdetect
     from langdetect.lang_detect_exception import LangDetectException
@@ -1292,73 +1294,56 @@ def _token_overlap(a: set[str], b: set[str]) -> float:
     return len(a & b) / min(len(a), len(b))
 
 
-def _content_similarity(a: str, b: str, sample: int = 800) -> float:
-    """Character-level Jaccard on 3-grams of the first `sample` chars."""
-    def trigrams(s: str) -> set[str]:
-        s = re.sub(r"\s+", " ", s.lower().strip())[:sample]
-        return {s[i:i+3] for i in range(len(s) - 2)}
-    ta, tb = trigrams(a), trigrams(b)
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / len(ta | tb)
-
-
 # Last completed duplicate scan (in memory) so revisiting the page needs no rescan
 _last_duplicate_scan: dict[str, Any] | None = None
 
 
-def _duplicate_result(g: dict[str, Any]) -> dict[str, Any] | None:
-    """Final confidence for a candidate group; None when the LLM ruled it out.
+DUP_MIN_SIMILARITY = float(os.getenv("DUP_MIN_SIMILARITY", "0.3"))
+# Per document in the LLM prompt. Two documents plus prompt must fit the Ollama
+# context (16k tokens on north): 2 x 12000 chars ~ 8k tokens.
+DUP_LLM_DOC_CHARS = int(os.getenv("DUP_LLM_DOC_CHARS", "12000"))
+DUP_CACHE_FILE = CONFIG_DIR / "duplicate_verdicts.json"
+DUP_LAST_SCAN_FILE = CONFIG_DIR / "duplicate_last_scan.json"
 
-    High     → content nearly identical (≥ 0.85) OR LLM says duplicate
-    Medium   → ambiguous (0.35–0.85) and LLM inconclusive
-    Possible → metadata match only, or LLM says same template
-    """
-    sim = g["max_similarity"]
-    llm_verdict = g.get("llm_verdict")
-    if llm_verdict == "different":
-        return None
-    if sim >= 0.85 or llm_verdict == "duplicate":
-        confidence = "high"
-    elif 0.35 <= sim < 0.85 and llm_verdict == "same_template":
-        confidence = "possible"
-    elif sim >= 0.35:
-        confidence = "medium"
-    else:
-        confidence = "possible"
 
-    docs_in = g["docs"]
-    best_id = max(docs_in, key=lambda e: (e["content_len"], e["completeness"], e["heuristic_quality"]))["id"]
+def _doc_summary(e: dict[str, Any], best_id: int) -> dict[str, Any]:
+    return {
+        "id": e["id"],
+        "title": e["title"],
+        "correspondent": e["correspondent"],
+        "document_type": e["document_type"],
+        "date": e["date"],
+        "tags": e["tags"],
+        "heuristic_quality": e["heuristic_quality"],
+        "completeness": e["completeness"],
+        "content_len": e["content_len"],
+        "is_best": e["id"] == best_id,
+    }
+
+
+def _pair_result(a: dict[str, Any], b: dict[str, Any], similarity: float, source: str,
+                 confidence: str, verdict: str, reasoning: str) -> dict[str, Any]:
+    best_id = max((a, b), key=lambda e: (e["content_len"], e["completeness"], e["heuristic_quality"]))["id"]
     return {
         "confidence": confidence,
-        "reason": g["meta_reason"],
-        "llm_verdict": llm_verdict,
-        "llm_reasoning": g.get("llm_reasoning", ""),
-        "pairs": g["pairs"],
+        "reason": f"Text {round(similarity * 100)}% identical · {source}",
+        "llm_verdict": verdict,
+        "llm_reasoning": reasoning,
+        "pairs": [{"id_a": a["id"], "id_b": b["id"], "similarity": round(similarity, 3)}],
         "best_id": best_id,
-        "snippets": {e["id"]: e["content"][:400] for e in docs_in},
-        "documents": [
-            {
-                "id": e["id"],
-                "title": e["title"],
-                "correspondent": e["correspondent"],
-                "document_type": e["document_type"],
-                "date": e["date"],
-                "tags": e["tags"],
-                "heuristic_quality": e["heuristic_quality"],
-                "completeness": e["completeness"],
-                "content_len": e["content_len"],
-                "is_best": e["id"] == best_id,
-            }
-            for e in docs_in
-        ],
+        "snippets": {e["id"]: e["content"][:400] for e in (a, b)},
+        "documents": [_doc_summary(e, best_id) for e in (a, b)],
     }
 
 
 @app.get("/api/duplicates/last")
 async def last_duplicate_scan() -> dict[str, Any]:
+    global _last_duplicate_scan
     if _last_duplicate_scan is None:
-        raise HTTPException(status_code=404, detail="No scan has been run yet")
+        try:
+            _last_duplicate_scan = json.loads(DUP_LAST_SCAN_FILE.read_text())
+        except (FileNotFoundError, ValueError):
+            raise HTTPException(status_code=404, detail="No scan has been run yet")
     return _last_duplicate_scan
 
 
@@ -1426,6 +1411,8 @@ async def scan_duplicates(request: Request) -> StreamingResponse:
                     "completeness": completeness,
                     "content": content,
                     "content_len": len(content),
+                    "page_count": d.get("page_count"),
+                    "modified": d.get("modified"),
                 })
 
             # Build raw candidate groups (all start as "possible")
@@ -1476,128 +1463,100 @@ async def scan_duplicates(request: Request) -> StreamingResponse:
 
             yield _sse("progress", {"phase": 1, "phase_label": "Phase 1/3", "detail": f"Found {len(raw_groups)} candidate group(s)."})
 
-            # ── Phase 2: content similarity for every candidate pair ───────────
-            yield _sse("progress", {"phase": 2, "phase_label": "Phase 2/3", "detail": f"Comparing content for {len(raw_groups)} group(s)…"})
-
-            # Attach pairwise content similarity to each group
+            # ── Phase 2: full-text similarity, candidates from metadata AND content ──
+            yield _sse("progress", {"phase": 2, "phase_label": "Phase 2/3", "detail": "Comparing full text of all documents…"})
+            by_id = {e["id"]: e for e in entries}
+            shingle_sets = {e["id"]: dup.shingles(e["content"]) for e in entries}
+            # Every pair inside a metadata group is a candidate
+            sources: dict[tuple[int, int], str] = {}
             for g in raw_groups:
-                docs_in = g["docs"]
-                pairs: list[dict] = []
-                for i in range(len(docs_in)):
-                    for j in range(i + 1, len(docs_in)):
-                        sim = _content_similarity(docs_in[i]["content"], docs_in[j]["content"])
-                        pairs.append({
-                            "id_a": docs_in[i]["id"],
-                            "id_b": docs_in[j]["id"],
-                            "similarity": round(sim, 3),
-                        })
-                g["pairs"] = pairs
-                # Max similarity across all pairs in the group
-                g["max_similarity"] = max((p["similarity"] for p in pairs), default=0.0)
+                ids = sorted(e["id"] for e in g["docs"])
+                for i in range(len(ids)):
+                    for j in range(i + 1, len(ids)):
+                        sources.setdefault((ids[i], ids[j]), g["meta_reason"].split(" (")[0])
+            # Plus every pair whose text overlaps, whatever its metadata (re-scans
+            # often get a different date or no correspondent)
+            for pair in dup.content_candidate_pairs(shingle_sets, DUP_MIN_SIMILARITY):
+                sources.setdefault(pair, "Found by text")
+            candidates = []
+            for (a_id, b_id), source in sources.items():
+                sim = dup.jaccard(shingle_sets[a_id], shingle_sets[b_id])
+                if sim >= DUP_MIN_SIMILARITY:
+                    candidates.append((by_id[a_id], by_id[b_id], sim, source))
+            candidates.sort(key=lambda c: -c[2])
+            yield _sse("progress", {"phase": 2, "phase_label": "Phase 2/3",
+                                    "detail": f"{len(candidates)} pair(s) share at least {round(DUP_MIN_SIMILARITY * 100)}% of their text."})
 
-            # ── Emit groups that need no LLM right away ───────────────────────
-            ambiguous = [g for g in raw_groups if 0.35 <= g["max_similarity"] < 0.85]
+            # ── Phase 3: LLM reads both documents in full, per pair ──────────────
+            cache = dup.VerdictCache(DUP_CACHE_FILE, settings.ollama_model)
+            from openai import AsyncOpenAI
+            llm_client = instructor.from_openai(
+                AsyncOpenAI(base_url=f"{settings.ollama_base_url.rstrip('/')}/v1", api_key="ollama",
+                            timeout=httpx.Timeout(timeout=300.0, connect=30.0)),
+                mode=instructor.Mode.JSON,
+            )
+
+            class _PairVerdict(BaseModel):
+                verdict: str = "different"
+                reasoning: str = ""
+
+            cached_count = sum(1 for a, b, _, _ in candidates if cache.get(a, b))
             emitted: list[dict[str, Any]] = []
-            for g in raw_groups:
-                if 0.35 <= g["max_similarity"] < 0.85:
-                    continue
-                result = _duplicate_result(g)
-                if result:
-                    emitted.append(result)
-                    yield _sse("result", result)
-
-            # ── Phase 3: LLM review for ambiguous pairs (sim 0.35–0.85) ────────
             yield _sse("progress", {
-                "phase": 3,
-                "phase_label": "Phase 3/3",
-                "current": 0,
-                "total": len(ambiguous),
-                "detail": f"LLM reviewing {len(ambiguous)} ambiguous group(s)…" if ambiguous else "No ambiguous groups — skipping LLM.",
+                "phase": 3, "phase_label": "Phase 3/3", "current": 0, "total": len(candidates),
+                "detail": f"LLM checking {len(candidates)} pair(s) with full text ({cached_count} already known)…",
             })
-
-            for idx, g in enumerate(ambiguous):
+            for idx, (a, b, sim, source) in enumerate(candidates):
                 if await request.is_disconnected():
-                    logger.info("Duplicate scan cancelled by client after %d/%d LLM reviews", idx, len(ambiguous))
+                    logger.info("Duplicate scan cancelled by client after %d/%d pairs", idx, len(candidates))
+                    cache.save()
                     return
-                docs_in = g["docs"]
-                # Build snippet pairs for LLM
-                snippets_for_llm = [
-                    {"id": e["id"], "title": e["title"],
-                     "snippet": content_for_llm(e["content"], LLM_DUPLICATE_SNIPPET_CHARS)}
-                    for e in docs_in
-                ]
-                snippet_text = "\n\n".join(
-                    f'Document {i+1} (id={s["id"]}, title="{s["title"]}"):\n{s["snippet"]}'
-                    for i, s in enumerate(snippets_for_llm)
-                )
+                known = cache.get(a, b)
+                if known:
+                    verdict, reasoning = known["verdict"], known["reasoning"]
+                else:
+                    try:
+                        resp: _PairVerdict = await asyncio.wait_for(
+                            llm_client.chat.completions.create(
+                                model=settings.ollama_model,
+                                messages=[
+                                    {"role": "system", "content": dup.SYSTEM_PROMPT},
+                                    {"role": "user", "content": dup.build_user_prompt(
+                                        a, b,
+                                        content_for_llm(a["content"], DUP_LLM_DOC_CHARS),
+                                        content_for_llm(b["content"], DUP_LLM_DOC_CHARS))},
+                                ],
+                                response_model=_PairVerdict,
+                                temperature=0.0,
+                                extra_body=LLM_EXTRA_BODY,
+                            ),
+                            timeout=300.0,
+                        )
+                        verdict = resp.verdict if resp.verdict in ("duplicate", "different") else "unknown"
+                        reasoning = resp.reasoning
+                        if verdict != "unknown":
+                            cache.put(a, b, verdict, reasoning)
+                            cache.save()
+                    except Exception:
+                        logger.exception("LLM verdict failed for pair %s-%s", a["id"], b["id"])
+                        verdict, reasoning = "unknown", ""
 
-                llm_prompt_system = """/no_think
-You are a document duplicate detector. Given content snippets from two or more documents, decide whether they are:
-- "duplicate": the same document uploaded/scanned more than once (content is the same)
-- "same_template": the same form or letter sent to different people (same structure, different recipient/personal details)
-- "different": distinct documents that happen to share metadata
-
-Respond with a single JSON object:
-{"verdict": "duplicate"|"same_template"|"different", "reasoning": "one sentence explanation"}
-
-No text outside the JSON."""
-
-                llm_prompt_user = f"Compare these document snippets:\n\n{snippet_text}"
-
-                llm_verdict = "unknown"
-                llm_reasoning = ""
-                try:
-                    from openai import AsyncOpenAI
-                    base = settings.ollama_base_url.rstrip("/")
-                    openai_client = AsyncOpenAI(
-                        base_url=f"{base}/v1",
-                        api_key="ollama",
-                        timeout=httpx.Timeout(timeout=300.0, connect=30.0),
-                    )
-                    llm_client = instructor.from_openai(openai_client, mode=instructor.Mode.JSON)
-
-                    class _LLMVerdict(BaseModel):
-                        verdict: str = "different"
-                        reasoning: str = ""
-
-                    resp: _LLMVerdict = await asyncio.wait_for(
-                        llm_client.chat.completions.create(
-                            model=settings.ollama_model,
-                            messages=[
-                                {"role": "system", "content": llm_prompt_system},
-                                {"role": "user", "content": llm_prompt_user},
-                            ],
-                            response_model=_LLMVerdict,
-                            temperature=0.0,
-                            extra_body=LLM_EXTRA_BODY,
-                        ),
-                        timeout=300.0,
-                    )
-                    llm_verdict = resp.verdict if resp.verdict in ("duplicate", "same_template", "different") else "unknown"
-                    llm_reasoning = resp.reasoning
-                except Exception:
-                    logger.exception("LLM verdict failed for duplicate group, skipping")
-                    llm_verdict = "unknown"
-
-                g["llm_verdict"] = llm_verdict
-                g["llm_reasoning"] = llm_reasoning
-
-                # Emit as soon as this group is decided
-                result = _duplicate_result(g)
-                if result:
+                confidence = dup.pair_confidence(verdict, sim, a["content"], b["content"])
+                if confidence:
+                    result = _pair_result(a, b, sim, source, confidence, verdict, reasoning)
                     emitted.append(result)
                     yield _sse("result", result)
-
                 yield _sse("progress", {
-                    "phase": 3,
-                    "phase_label": "Phase 3/3",
-                    "current": idx + 1,
-                    "total": len(ambiguous),
-                    "detail": f"LLM reviewed group {idx + 1} of {len(ambiguous)}",
+                    "phase": 3, "phase_label": "Phase 3/3", "current": idx + 1, "total": len(candidates),
+                    "detail": f"Checked pair {idx + 1} of {len(candidates)}",
                 })
 
             global _last_duplicate_scan
             _last_duplicate_scan = {"finished_at": time.time(), "results": emitted}
+            try:
+                DUP_LAST_SCAN_FILE.write_text(json.dumps(_last_duplicate_scan))
+            except OSError:
+                logger.exception("Could not persist the duplicate scan result")
             total_emitted = len(emitted)
 
             yield _sse("done", {"total": total_emitted})

@@ -34,6 +34,7 @@ const closePreviewBtn = document.getElementById('closePreviewBtn');
 const cancelScanBtn   = document.getElementById('cancelScanBtn');
 const progressTrack   = document.getElementById('progressTrack');
 const dismissedNote   = document.getElementById('dismissedNote');
+const highOnlyToggle  = document.getElementById('highOnlyToggle');
 
 // ── Dismissed groups ("not duplicates") — remembered in this browser ──────────
 const DISMISSED_KEY = 'paperlessCleaner.dismissedDuplicateGroups';
@@ -48,12 +49,25 @@ function saveDismissed(set) {
 }
 let dismissed = loadDismissed();
 
+// Default view: only pairs the LLM confirmed as the same document
+const HIGH_ONLY_KEY = 'paperlessCleaner.duplicatesHighOnly';
+try { const v = localStorage.getItem(HIGH_ONLY_KEY); if (v !== null) highOnlyToggle.checked = v === '1'; } catch (_) {}
+highOnlyToggle.addEventListener('change', () => {
+  try { localStorage.setItem(HIGH_ONLY_KEY, highOnlyToggle.checked ? '1' : '0'); } catch (_) {}
+  rerenderAll();
+  scanSummary.style.display = '';
+  scanSummary.textContent = summaryText('');
+});
+function passesFilter(g) {
+  return !highOnlyToggle.checked || g.confidence === 'high';
+}
+
 function visibleGroups() {
-  return groups.filter(g => !dismissed.has(groupKey(g)));
+  return groups.filter(g => !dismissed.has(groupKey(g)) && passesFilter(g));
 }
 
 function renderDismissedNote() {
-  const hiddenCount = groups.length - visibleGroups().length;
+  const hiddenCount = groups.filter(g => dismissed.has(groupKey(g))).length;
   dismissedNote.hidden = hiddenCount === 0;
   dismissedNote.textContent = '';
   if (!hiddenCount) return;
@@ -71,20 +85,22 @@ function renderDismissedNote() {
 
 function rerenderAll() {
   groupsContainer.innerHTML = '';
-  groups.forEach((g, i) => renderGroup(g, i));
+  groups.forEach((g, i) => { if (passesFilter(g)) renderGroup(g, i); });
   resultsSection.style.display = visibleGroups().length ? '' : 'none';
   renderDismissedNote();
 }
 
 function summaryText(prefix) {
-  const shown = visibleGroups();
-  if (!shown.length) return `${prefix}no potential duplicates found.`;
+  const shown = groups.filter(g => !dismissed.has(groupKey(g)));
+  if (!shown.length) return `${prefix}no duplicates found.`;
   const high     = shown.filter(g => g.confidence === 'high').length;
   const medium   = shown.filter(g => g.confidence === 'medium').length;
   const possible = shown.filter(g => g.confidence === 'possible').length;
-  return `${prefix}${shown.length} group${shown.length !== 1 ? 's' : ''}: ` +
+  const hiddenByFilter = highOnlyToggle.checked ? shown.length - high : 0;
+  return `${prefix}${shown.length} pair${shown.length !== 1 ? 's' : ''}: ` +
     [high && `${high} high confidence`, medium && `${medium} medium`, possible && `${possible} possible`]
-      .filter(Boolean).join(', ') + '.';
+      .filter(Boolean).join(', ') + '.' +
+    (hiddenByFilter ? ` Showing only the ${high} high-confidence pair${high !== 1 ? 's' : ''}.` : '');
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -145,17 +161,17 @@ function runScan() {
 
   es.addEventListener('progress', e => {
     const d = JSON.parse(e.data);
-    // Phases 1–2 are quick (0–20%); phase 3 tracks the LLM group count (20–100%)
+    // Phases 1–2 are quick (0–20%); phase 3 tracks the LLM pair count (20–100%)
     let pct = d.phase === 1 ? 5 : d.phase === 2 ? 15 : 20;
     if (d.phase === 3 && d.total) pct = 20 + Math.round(80 * d.current / d.total);
-    const label = { 1: 'Step 1 of 3 — reading documents', 2: 'Step 2 of 3 — comparing text', 3: 'Step 3 of 3 — LLM check' }[d.phase] || d.phase_label;
+    const label = { 1: 'Step 1 of 3 — reading documents', 2: 'Step 2 of 3 — comparing full text', 3: 'Step 3 of 3 — LLM reads both documents' }[d.phase] || d.phase_label;
     setProgress(pct, label, d.detail);
   });
 
   es.addEventListener('result', e => {
     const group = JSON.parse(e.data);
     groups.push(group);
-    renderGroup(group, groups.length - 1);
+    if (passesFilter(group)) renderGroup(group, groups.length - 1);
     if (visibleGroups().length) resultsSection.style.display = '';
     renderDismissedNote();
     scanSummary.style.display = '';
@@ -208,7 +224,7 @@ const CONF_LABEL = { high: 'High confidence', medium: 'Medium confidence', possi
 const CONF_CLASS = { high: 'conf-high', medium: 'conf-medium', possible: 'conf-possible' };
 
 const VERDICT_LABEL = {
-  duplicate:     { text: 'LLM: likely duplicate',           cls: 'verdict-identical' },
+  duplicate:     { text: 'LLM: same document',              cls: 'verdict-identical' },
   same_template: { text: 'LLM: same template, diff. recipient', cls: 'verdict-template' },
   different:     { text: 'LLM: different documents',        cls: 'verdict-different' },
   unknown:       { text: 'LLM: inconclusive',               cls: 'verdict-unknown' },
@@ -252,6 +268,13 @@ function renderGroup(group, idx) {
     </div>
   `;
   card.appendChild(header);
+
+  if (group.llm_reasoning) {
+    const why = document.createElement('p');
+    why.className = 'dup-llm-reasoning';
+    why.textContent = group.llm_reasoning;
+    card.appendChild(why);
+  }
 
   // ── Document table ─────────────────────────────────────────────────────────
   const table = document.createElement('table');

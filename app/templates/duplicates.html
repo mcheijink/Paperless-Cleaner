@@ -19,9 +19,10 @@
     <main id="mainLayout">
 
       <p class="page-intro">
-        Finds documents that were probably added to Paperless more than once. Documents are grouped by
-        matching date, correspondent and title, their text is compared, and unclear groups are checked by the LLM —
-        that last step can take several minutes. Results appear as soon as each group is decided.
+        Finds documents that were added to Paperless more than once. Candidate pairs come from matching
+        metadata and from overlapping text; the LLM then reads both documents in full and decides whether they
+        are the same document. Look-alikes such as the salary statement of another month or year are not duplicates.
+        The first scan can take half an hour; verdicts are remembered, so later scans only check new or changed documents.
         Nothing is changed or deleted: open the copy you do not want in Paperless and delete it there.
       </p>
 
@@ -29,6 +30,7 @@
       <section class="toolbar">
         <button id="scanBtn">Scan for duplicates</button>
         <button id="cancelScanBtn" class="btn-danger" hidden>Cancel scan</button>
+        <label class="dup-filter-toggle"><input type="checkbox" id="highOnlyToggle" checked /> Only high confidence</label>
         <span id="scanSummary" class="progress-label" style="display:none;white-space:normal"></span>
       </section>
 
